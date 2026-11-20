@@ -5,7 +5,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
@@ -132,7 +132,6 @@ fn download_updates(download_dir: &str, os_type: &str) -> (bool, String) {
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
-        // Alt Linux
         let _ = Command::new(pm).arg("update").status();
         let sim_output = Command::new(pm)
             .arg("upgrade")
@@ -348,7 +347,7 @@ const COMMANDS: &[CommandItem] = &[
     CommandItem {
         id: "detect_os",
         name: "Информация о системе",
-        description: "Показывает определнную ОС, архитектуру и статус папок/архивов.",
+        description: "Показывает определённую ОС, архитектуру и статус папок/архивов.",
         icon: "ℹ",
     },
     CommandItem {
@@ -419,28 +418,23 @@ impl App {
         self.progress_label = format!("Выполняю: {}...", cmd.name);
         self.status = format!("▶ {}", cmd.name);
 
-        let (tx, rx) = mpsc::channel();
+        // Явно указываем тип канала, чтобы компилятор не путался
+        let (tx, rx): (mpsc::Sender<(bool, String)>, mpsc::Receiver<(bool, String)>) = mpsc::channel();
         let os_type = self.os_type.clone();
         let download_dir = self.download_dir.clone();
         let archive_name = self.archive_name.clone();
         let cmd_id = cmd.id.to_string();
 
         thread::spawn(move || {
-            let result = match cmd_id.as_str() {
+            let result: (bool, String) = match cmd_id.as_str() {
                 "download_updates" => {
                     let (ok, msg) = download_updates(&download_dir, &os_type);
-                    if ok {
-                        compress_folder(&download_dir, &archive_name)
-                    } else {
-                        (false, msg)
-                    }
+                    if ok { compress_folder(&download_dir, &archive_name) } else { (false, msg) }
                 }
                 "install_updates" => {
                     if Path::new(&archive_name).exists() {
                         let (ok, msg) = decompress_archive(&archive_name, &download_dir);
-                        if !ok {
-                            return (false, msg);
-                        }
+                        if !ok { return (false, msg); }
                     } else if !Path::new(&download_dir).exists() {
                         return (false, "Не найден ни архив, ни папка".to_string());
                     }
@@ -449,18 +443,12 @@ impl App {
                 "download_packages" => {
                     let packages = get_packages();
                     let (ok, msg) = download_packages(&packages, &download_dir, &os_type);
-                    if ok {
-                        compress_folder(&download_dir, &archive_name)
-                    } else {
-                        (false, msg)
-                    }
+                    if ok { compress_folder(&download_dir, &archive_name) } else { (false, msg) }
                 }
                 "install_packages" => {
                     if Path::new(&archive_name).exists() {
                         let (ok, msg) = decompress_archive(&archive_name, &download_dir);
-                        if !ok {
-                            return (false, msg);
-                        }
+                        if !ok { return (false, msg); }
                     } else if !Path::new(&download_dir).exists() {
                         return (false, "Не найден ни архив, ни папка".to_string());
                     }
@@ -484,10 +472,11 @@ impl App {
                 "exit" => (true, "Выход".to_string()),
                 _ => (false, "Неизвестная команда".to_string()),
             };
-            let _ = tx.send(result);
+            
+            let _ = tx.send(result.clone());
+            result // <-- Возвращаем result, чтобы удовлетворить компилятор
         });
 
-        // Ждём результат с обновлением прогресса
         loop {
             match rx.try_recv() {
                 Ok((ok, msg)) => {
@@ -502,7 +491,6 @@ impl App {
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    // Имитация прогресса пока ждём
                     self.progress = (self.progress + 0.02).min(0.95);
                     thread::sleep(Duration::from_millis(200));
                 }
@@ -520,14 +508,13 @@ fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Шапка
-            Constraint::Min(0),     // Основной контент (2 колонки)
-            Constraint::Length(3),  // Прогресс-бар
-            Constraint::Length(3),  // Статус
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+            Constraint::Length(3),
         ])
         .split(f.area());
 
-    // === ШАПКА ===
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(" ШКОЛЬНЫЙ УСТАНОВЩИК ПО ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -538,13 +525,11 @@ fn ui(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(header, chunks[0]);
 
-    // === ОСНОВНОЙ КОНТЕНТ (2 колонки) ===
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
-    // Левая панель — список команд
     let items: Vec<ListItem> = COMMANDS
         .iter()
         .enumerate()
@@ -577,7 +562,6 @@ fn ui(f: &mut Frame, app: &App) {
         .highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
 
-    // Правая панель — описание
     let selected_cmd = &COMMANDS[app.selected];
     let description_text = vec![
         Line::from(""),
@@ -594,7 +578,7 @@ fn ui(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("Статус: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(&app.status),
+        Line::from(app.status.as_str()), // <-- ИСПРАВЛЕНО: .as_str() вместо &app.status
     ];
 
     let description = Paragraph::new(description_text)
@@ -607,7 +591,6 @@ fn ui(f: &mut Frame, app: &App) {
         .wrap(Wrap { trim: false });
     f.render_widget(description, main_chunks[1]);
 
-    // === ПРОГРЕСС-БАР ===
     let progress_width = (app.progress * 100.0) as u16;
     let progress_bar = if app.is_running {
         let filled = "█".repeat(progress_width as usize);
@@ -628,7 +611,6 @@ fn ui(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(progress_bar, chunks[2]);
 
-    // === СТАТУС ===
     let status_color = if app.status.starts_with("✓") {
         Color::Green
     } else if app.status.starts_with("✗") {
@@ -640,17 +622,15 @@ fn ui(f: &mut Frame, app: &App) {
     };
     let status_widget = Paragraph::new(vec![Line::from(vec![
         Span::styled(" Статус: ", Style::default().fg(Color::Cyan)),
-        Span::styled(&app.status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+        Span::styled(app.status.as_str(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)), // <-- ИСПРАВЛЕНО
     ])])
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(status_widget, chunks[3]);
 }
 
 fn main() -> io::Result<()> {
-    // Проверяем аргументы командной строки (для обратной совместимости)
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
-        // Старый режим работы через аргументы
         let mode = args[1].trim_start_matches("--");
         let os_type = detect_os();
         let download_dir = "school_packages";
@@ -685,7 +665,6 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // TUI режим
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
