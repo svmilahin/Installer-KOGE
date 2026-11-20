@@ -167,7 +167,7 @@ fn compress_folder(folder: &str, archive: &str, tx: &mpsc::Sender<LogEvent>) -> 
     let _ = fs::remove_file(archive);
 
     let _ = tx.send(LogEvent::Progress(0.3, "Упаковка...".to_string()));
-    let cmd = Command::new("tar");
+    let mut cmd = Command::new("tar"); // <-- ИСПРАВЛЕНО: добавлен mut
     cmd.arg("-czf").arg(archive).arg(folder);
     let status = run_process(cmd, tx);
 
@@ -676,7 +676,7 @@ fn ui(f: &mut Frame, app: &App) {
     .wrap(Wrap { trim: false });
     f.render_widget(desc, right_chunks[0]);
 
-    // Лог (ИСПРАВЛЕНО: объединяем Vec<String> в один String через \n)
+    // Лог
     let height = right_chunks[1].height.saturating_sub(2) as usize;
     let start = app.log_lines.len().saturating_sub(height);
     let log_text = app.log_lines[start..].join("\n");
