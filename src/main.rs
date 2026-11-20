@@ -82,7 +82,6 @@ fn parse_progress(s: &str) -> Option<(u32, u32)> {
 // ==================== ЗАПУСК ПРОЦЕССА С ПЕРЕХВАТОМ ====================
 
 /// Запускает команду, перехватывая stdout (в лог) и stderr (в прогресс).
-/// Возвращает ExitStatus.
 fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<ExitStatus> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -169,6 +168,7 @@ fn compress_folder(folder: &str, archive: &str, tx: &mpsc::Sender<LogEvent>) -> 
 
     let _ = tx.send(LogEvent::Progress(0.3, "Упаковка...".to_string()));
     let cmd = Command::new("tar");
+    cmd.arg("-czf").arg(archive).arg(folder);
     let status = run_process(cmd, tx);
 
     match status {
@@ -227,7 +227,6 @@ fn download_updates(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEven
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
-        // Alt Linux
         let mut cmd1 = Command::new(pm);
         cmd1.arg("update");
         let _ = run_process(cmd1, tx);
@@ -677,17 +676,15 @@ fn ui(f: &mut Frame, app: &App) {
     .wrap(Wrap { trim: false });
     f.render_widget(desc, right_chunks[0]);
 
-    // Лог
-    let log_widget = Paragraph::new(app.log_lines.clone())
-        .block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-        .wrap(Wrap { trim: false });
-    // автоскролл: показываем последние строки
+    // Лог (ИСПРАВЛЕНО: объединяем Vec<String> в один String через \n)
     let height = right_chunks[1].height.saturating_sub(2) as usize;
     let start = app.log_lines.len().saturating_sub(height);
-    f.render_widget(Paragraph::new(app.log_lines[start..].to_vec())
+    let log_text = app.log_lines[start..].join("\n");
+    
+    let log_widget = Paragraph::new(log_text)
         .block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-        .wrap(Wrap { trim: false }), right_chunks[1]);
-    let _ = log_widget;
+        .wrap(Wrap { trim: false });
+    f.render_widget(log_widget, right_chunks[1]);
 
     // Прогресс-бар
     let progress_width = (app.progress * 100.0) as u16;
