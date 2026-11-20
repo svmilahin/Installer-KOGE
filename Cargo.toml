@@ -1,12 +1,8 @@
 [package]
-name = "installer_koge"
+name = "school-installer"
 version = "0.1.0"
 edition = "2026"
 
-[[bin]]
-name = "school-installer"
-path = "src/main.rs"
-
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.28"
 crossterm = "0.28"
