@@ -17,6 +17,15 @@ fn detect_os() -> String {
     "unknown".to_string()
 }
 
+/// Определяем архитектуру системы (x86_64, aarch64, i686 и т.д.)
+fn detect_arch() -> String {
+    Command::new("uname")
+        .arg("-m")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase().to_string())
+        .unwrap_or_else(|_| "x86_64".to_string())
+}
+
 /// Получаем размер папки рекурсивно (в байтах)
 fn get_folder_size(path: &str) -> u64 {
     let mut total: u64 = 0;
@@ -35,6 +44,34 @@ fn get_folder_size(path: &str) -> u64 {
     total
 }
 
+/// Проверяем, подходит ли пакет под архитектуру системы
+/// Формат имени RPM: name-version-release.architecture.rpm
+/// Пример: notepadqq-1.4.8-3.x86_64.rpm или python3-3.12-1.noarch.rpm
+fn is_package_for_arch(filename: &str, system_arch: &str) -> bool {
+    let path = Path::new(filename);
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    
+    // Берём последнюю часть после точки — это архитектура
+    if let Some(arch) = stem.split('.').last() {
+        // noarch подходит для любой архитектуры
+        if arch == "noarch" {
+            return true;
+        }
+        // Проверяем точное совпадение
+        if arch == system_arch {
+            return true;
+        }
+        // x86_64 система может ставить i686 пакеты (но не наоборот)
+        if system_arch == "x86_64" && arch == "i686" {
+            return false; // Исключаем i686 на x86_64 системе, чтобы избежать конфликтов
+        }
+        return false;
+    }
+    
+    // Если не удалось определить архитектуру, включаем пакет (на всякий случай)
+    true
+}
+
 /// Архивируем папку с пакетами в tar.gz
 fn compress_folder(folder: &str, archive: &str) -> bool {
     println!("\n[📦] Архивирую папку {} в {}...", folder, archive);
@@ -42,7 +79,6 @@ fn compress_folder(folder: &str, archive: &str) -> bool {
     let size_before = get_folder_size(folder);
     println!("[i] Размер папки до сжатия: {:.2} MB", size_before as f64 / 1024.0 / 1024.0);
 
-    // Удаляем старый архив, если есть
     let _ = fs::remove_file(archive);
 
     let status = Command::new("tar")
@@ -89,7 +125,6 @@ fn decompress_archive(archive: &str, folder: &str) -> bool {
         println!("[i] Размер архива: {:.2} MB", meta.len() as f64 / 1024.0 / 1024.0);
     }
 
-    // Создаём папку, если её нет
     let _ = fs::create_dir_all(folder);
 
     let status = Command::new("tar")
@@ -237,10 +272,14 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str) -> bo
 
     match os_type {
         "rosa" => {
+            // Исключаем i686 пакеты при скачивании, чтобы не было конфликтов
             let mut cmd = Command::new(pm);
             cmd.arg("download")
                 .arg("--resolve")
                 .arg("--alldeps")
+                .arg("--exclude=*.i686")
+                .arg("--exclude=*.i586")
+                .arg("--exclude=*.i386")
                 .arg(format!("--destdir={}", download_dir));
             for pkg in packages {
                 cmd.arg(pkg);
@@ -295,14 +334,17 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str) -> bo
     }
 }
 
-/// Устанавливаем пакеты из папки (с флагом --allowerasing для ROSA)
+/// Устанавливаем пакеты из папки (с фильтрацией по архитектуре)
 fn install_from_folder(download_dir: &str, os_type: &str) -> bool {
     println!("\n[↑] Установка пакетов из папки...");
+
+    let system_arch = detect_arch();
+    println!("[*] Архитектура системы: {}", system_arch);
 
     let extension = if os_type == "rosa" { "rpm" } else { "deb" };
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
 
-    let files: Vec<String> = match fs::read_dir(download_dir) {
+    let all_files: Vec<String> = match fs::read_dir(download_dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
             .filter_map(|e| {
@@ -320,17 +362,28 @@ fn install_from_folder(download_dir: &str, os_type: &str) -> bool {
         }
     };
 
-    if files.is_empty() {
+    if all_files.is_empty() {
         println!("[-] В папке не найдено .{} файлов", extension);
         return false;
     }
 
-    println!("[*] Найдено {} пакетов", files.len());
+    // Фильтруем пакеты по архитектуре
+    let files: Vec<String> = all_files
+        .into_iter()
+        .filter(|f| is_package_for_arch(f, &system_arch))
+        .collect();
+
+    let filtered_count = files.len();
+    println!("[*] Всего пакетов в папке: {}", filtered_count);
+    println!("[*] Пакетов для установки (под архитектуру {}): {}", system_arch, filtered_count);
+
+    if files.is_empty() {
+        println!("[-] Нет пакетов для установки под архитектуру {}", system_arch);
+        return false;
+    }
 
     match os_type {
         "rosa" => {
-            // --allowerasing разрешает замену конфликтующих пакетов (обои, брендинг)
-            // --nobest позволяет использовать не только лучшие версии
             let mut cmd = Command::new(pm);
             cmd.arg("install")
                 .arg("-y")
@@ -389,12 +442,12 @@ fn install_from_folder(download_dir: &str, os_type: &str) -> bool {
     }
 }
 
-/// Список пакетов для установки (можно расширять)
+/// Список пакетов для установки
 fn get_packages() -> Vec<&'static str> {
     vec![
-        "task-koge",        // Метапакет для экзамена по информатике
-        "r7-office",        // Российский офисный пакет
-        "notepadqq",        // Аналог Notepad++ для Linux
+        "task-koge",
+        "r7-office",
+        "notepadqq",
     ]
 }
 
@@ -414,8 +467,11 @@ fn main() {
     };
 
     let os_type = detect_os();
+    let system_arch = detect_arch();
+    
     println!("=== Школьный установщик ===");
     println!("[*] ОС: {}", os_type);
+    println!("[*] Архитектура: {}", system_arch);
     println!("[*] Режим: {}", mode);
 
     if os_type == "unknown" {
