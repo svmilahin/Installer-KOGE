@@ -13,12 +13,114 @@ use ratatui::{
 };
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+// ==================== СОБЫТИЯ ДЛЯ TUI ====================
+
+#[derive(Clone)]
+enum LogEvent {
+    Line(String),
+    Progress(f64, String),
+    Done(bool, String),
+}
+
+// ==================== УТИЛИТЫ ====================
+
+/// Убирает ANSI escape-коды и \r из строки, чтобы не ломать TUI
+fn clean_line(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&c2) = chars.peek() {
+                    chars.next();
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else if c == '\r' {
+            // пропускаем
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Парсит все "[ a/b]" в строке и возвращает (max_done, max_total)
+fn parse_progress(s: &str) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32)> = None;
+    for chunk in s.split('[').skip(1) {
+        if let Some(end) = chunk.find(']') {
+            let inner = &chunk[..end];
+            if let Some(slash) = inner.find('/') {
+                if let (Ok(a), Ok(b)) = (
+                    inner[..slash].trim().parse::<u32>(),
+                    inner[slash + 1..].trim().parse::<u32>(),
+                ) {
+                    if b > 0 && a <= b {
+                        best = match best {
+                            None => Some((a, b)),
+                            Some((da, db)) => Some(if b > db { (a, b) } else { (da, db) }),
+                        };
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+// ==================== ЗАПУСК ПРОЦЕССА С ПЕРЕХВАТОМ ====================
+
+/// Запускает команду, перехватывая stdout (в лог) и stderr (в прогресс).
+/// Возвращает ExitStatus.
+fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<ExitStatus> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    // Поток для stderr: парсим прогресс "[ a/b]"
+    let stderr = child.stderr.take().unwrap();
+    let tx_err = tx.clone();
+    let err_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                if let Some((done, total)) = parse_progress(&l) {
+                    let pct = done as f64 / total as f64;
+                    let _ = tx_err.send(LogEvent::Progress(
+                        pct,
+                        format!("{} / {}", done, total),
+                    ));
+                }
+            }
+        }
+    });
+
+    // Текущий поток читает stdout -> в лог
+    let stdout = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        if let Ok(l) = line {
+            let cleaned = clean_line(&l);
+            if !cleaned.trim().is_empty() {
+                let _ = tx.send(LogEvent::Line(cleaned));
+            }
+        }
+    }
+
+    let status = child.wait()?;
+    let _ = err_handle.join();
+    Ok(status)
+}
 
 // ==================== ЛОГИКА ====================
 
@@ -60,16 +162,14 @@ fn get_folder_size(path: &str) -> u64 {
     total
 }
 
-fn compress_folder(folder: &str, archive: &str) -> (bool, String) {
+fn compress_folder(folder: &str, archive: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(folder);
     let size_before = get_folder_size(folder);
     let _ = fs::remove_file(archive);
 
-    let status = Command::new("tar")
-        .arg("-czf")
-        .arg(archive)
-        .arg(folder)
-        .status();
+    let _ = tx.send(LogEvent::Progress(0.3, "Упаковка...".to_string()));
+    let cmd = Command::new("tar");
+    let status = run_process(cmd, tx);
 
     match status {
         Ok(s) if s.success() => {
@@ -96,43 +196,42 @@ fn compress_folder(folder: &str, archive: &str) -> (bool, String) {
     }
 }
 
-fn decompress_archive(archive: &str, folder: &str) -> (bool, String) {
+fn decompress_archive(archive: &str, folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     if !Path::new(archive).exists() {
         return (false, format!("Архив не найден: {}", archive));
     }
     let _ = fs::create_dir_all(folder);
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(".")
-        .status();
-
-    match status {
+    let _ = tx.send(LogEvent::Progress(0.5, "Распаковка...".to_string()));
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xzf").arg(archive).arg("-C").arg(".");
+    match run_process(cmd, tx) {
         Ok(s) if s.success() => (true, format!("Распаковано в {}", folder)),
         Ok(s) => (false, format!("Ошибка распаковки. Код: {:?}", s.code())),
         Err(e) => (false, format!("Не удалось запустить tar: {}", e)),
     }
 }
 
-fn download_updates(download_dir: &str, os_type: &str) -> (bool, String) {
+fn download_updates(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
 
     if os_type == "rosa" {
-        let status = Command::new(pm)
-            .arg("upgrade")
+        let mut cmd = Command::new(pm);
+        cmd.arg("upgrade")
             .arg("--downloadonly")
             .arg(format!("--destdir={}", download_dir))
-            .arg("-y")
-            .status();
-        match status {
+            .arg("-y");
+        match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, "Обновления скачаны".to_string()),
             Ok(s) => (false, format!("Ошибка скачивания. Код: {:?}", s.code())),
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
-        let _ = Command::new(pm).arg("update").status();
+        // Alt Linux
+        let mut cmd1 = Command::new(pm);
+        cmd1.arg("update");
+        let _ = run_process(cmd1, tx);
+
         let sim_output = Command::new(pm)
             .arg("upgrade")
             .arg("--simulate")
@@ -151,22 +250,25 @@ fn download_updates(download_dir: &str, os_type: &str) -> (bool, String) {
             return (true, "Система уже обновлена".to_string());
         }
 
+        let total = packages.len();
+        let mut done = 0;
         let mut all_ok = true;
         for pkg in &packages {
-            let status = Command::new(pm)
-                .arg("install")
+            let mut cmd = Command::new(pm);
+            cmd.arg("install")
                 .arg("--download-only")
                 .arg("-y")
                 .arg(format!("-o Dir::Cache::Archives={}", download_dir))
-                .arg(pkg)
-                .status();
-            if let Ok(s) = status {
+                .arg(pkg);
+            if let Ok(s) = run_process(cmd, tx) {
                 if !s.success() {
                     all_ok = false;
                 }
             } else {
                 all_ok = false;
             }
+            done += 1;
+            let _ = tx.send(LogEvent::Progress(done as f64 / total as f64, format!("{} / {}", done, total)));
         }
         if all_ok {
             (true, format!("Скачано пакетов: {}", packages.len()))
@@ -176,7 +278,7 @@ fn download_updates(download_dir: &str, os_type: &str) -> (bool, String) {
     }
 }
 
-fn download_packages(packages: &[&str], download_dir: &str, os_type: &str) -> (bool, String) {
+fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
 
@@ -192,28 +294,31 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str) -> (b
         for pkg in packages {
             cmd.arg(pkg);
         }
-        match cmd.status() {
+        match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, "Пакеты скачаны".to_string()),
             Ok(s) => (false, format!("Ошибка. Код: {:?}", s.code())),
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
+        let total = packages.len();
+        let mut done = 0;
         let mut all_ok = true;
         for pkg in packages {
-            let status = Command::new(pm)
-                .arg("install")
+            let mut cmd = Command::new(pm);
+            cmd.arg("install")
                 .arg("--download-only")
                 .arg("-y")
                 .arg(format!("-o Dir::Cache::Archives={}", download_dir))
-                .arg(pkg)
-                .status();
-            if let Ok(s) = status {
+                .arg(pkg);
+            if let Ok(s) = run_process(cmd, tx) {
                 if !s.success() {
                     all_ok = false;
                 }
             } else {
                 all_ok = false;
             }
+            done += 1;
+            let _ = tx.send(LogEvent::Progress(done as f64 / total as f64, format!("{} / {}", done, total)));
         }
         if all_ok {
             (true, "Все пакеты скачаны".to_string())
@@ -227,10 +332,7 @@ fn is_package_for_arch(filename: &str, system_arch: &str) -> bool {
     let path = Path::new(filename);
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     if let Some(arch) = stem.split('.').last() {
-        if arch == "noarch" {
-            return true;
-        }
-        if arch == system_arch {
+        if arch == "noarch" || arch == system_arch {
             return true;
         }
         if system_arch == "x86_64" && arch == "i686" {
@@ -241,7 +343,7 @@ fn is_package_for_arch(filename: &str, system_arch: &str) -> bool {
     true
 }
 
-fn install_from_folder(download_dir: &str, os_type: &str) -> (bool, String) {
+fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
     let extension = if os_type == "rosa" { "rpm" } else { "deb" };
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
@@ -274,6 +376,8 @@ fn install_from_folder(download_dir: &str, os_type: &str) -> (bool, String) {
         return (false, format!("Нет пакетов под архитектуру {}", system_arch));
     }
 
+    let _ = tx.send(LogEvent::Line(format!("Найдено пакетов для установки: {}", files.len())));
+
     if os_type == "rosa" {
         let mut cmd = Command::new(pm);
         cmd.arg("install")
@@ -283,7 +387,7 @@ fn install_from_folder(download_dir: &str, os_type: &str) -> (bool, String) {
         for file in &files {
             cmd.arg(file);
         }
-        match cmd.status() {
+        match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, format!("Установлено пакетов: {}", files.len())),
             Ok(s) => (false, format!("Ошибка установки. Код: {:?}", s.code())),
             Err(e) => (false, format!("Не удалось запустить установку: {}", e)),
@@ -294,9 +398,11 @@ fn install_from_folder(download_dir: &str, os_type: &str) -> (bool, String) {
         for file in &files {
             cmd.arg(file);
         }
-        match cmd.status() {
+        match run_process(cmd, tx) {
             Ok(s) if s.success() => {
-                let _ = Command::new(pm).arg("install").arg("-f").arg("-y").status();
+                let mut cmd2 = Command::new(pm);
+                cmd2.arg("install").arg("-f").arg("-y");
+                let _ = run_process(cmd2, tx);
                 (true, format!("Установлено пакетов: {}", files.len()))
             }
             Ok(s) => (false, format!("Ошибка установки. Код: {:?}", s.code())),
@@ -307,6 +413,81 @@ fn install_from_folder(download_dir: &str, os_type: &str) -> (bool, String) {
 
 fn get_packages() -> Vec<&'static str> {
     vec!["task-koge", "r7-office", "notepadqq"]
+}
+
+/// Диспетчер команд — вызывается в worker-потоке
+fn run_command(
+    cmd_id: &str,
+    os_type: String,
+    download_dir: String,
+    archive_name: String,
+    tx: &mpsc::Sender<LogEvent>,
+) {
+    let result: (bool, String) = match cmd_id {
+        "download_updates" => {
+            let (ok, msg) = download_updates(&download_dir, &os_type, tx);
+            if ok {
+                compress_folder(&download_dir, &archive_name, tx)
+            } else {
+                (false, msg)
+            }
+        }
+        "install_updates" => {
+            if Path::new(&archive_name).exists() {
+                let (ok, msg) = decompress_archive(&archive_name, &download_dir, tx);
+                if !ok {
+                    (false, msg)
+                } else {
+                    install_from_folder(&download_dir, &os_type, tx)
+                }
+            } else if Path::new(&download_dir).exists() {
+                install_from_folder(&download_dir, &os_type, tx)
+            } else {
+                (false, "Не найден ни архив, ни папка".to_string())
+            }
+        }
+        "download_packages" => {
+            let packages = get_packages();
+            let (ok, msg) = download_packages(&packages, &download_dir, &os_type, tx);
+            if ok {
+                compress_folder(&download_dir, &archive_name, tx)
+            } else {
+                (false, msg)
+            }
+        }
+        "install_packages" => {
+            if Path::new(&archive_name).exists() {
+                let (ok, msg) = decompress_archive(&archive_name, &download_dir, tx);
+                if !ok {
+                    (false, msg)
+                } else {
+                    install_from_folder(&download_dir, &os_type, tx)
+                }
+            } else if Path::new(&download_dir).exists() {
+                install_from_folder(&download_dir, &os_type, tx)
+            } else {
+                (false, "Не найден ни архив, ни папка".to_string())
+            }
+        }
+        "detect_os" => {
+            let mut info = format!("ОС: {} | Архитектура: {}", os_type, detect_arch());
+            info += &format!(" | Папка: {}", Path::new(&download_dir).exists());
+            info += &format!(" | Архив: {}", Path::new(&archive_name).exists());
+            if Path::new(&download_dir).exists() {
+                let size = get_folder_size(&download_dir);
+                info += &format!(" | Размер папки: {:.2} MB", size as f64 / 1024.0 / 1024.0);
+            }
+            if Path::new(&archive_name).exists() {
+                if let Ok(meta) = fs::metadata(&archive_name) {
+                    info += &format!(" | Размер архива: {:.2} MB", meta.len() as f64 / 1024.0 / 1024.0);
+                }
+            }
+            (true, info)
+        }
+        "exit" => (true, "Выход".to_string()),
+        _ => (false, "Неизвестная команда".to_string()),
+    };
+    let _ = tx.send(LogEvent::Done(result.0, result.1));
 }
 
 // ==================== TUI ====================
@@ -320,42 +501,12 @@ struct CommandItem {
 }
 
 const COMMANDS: &[CommandItem] = &[
-    CommandItem {
-        id: "download_updates",
-        name: "Скачать обновления системы",
-        description: "Скачивает все доступные обновления системы в папку school_packages и создаёт архив school_packages.tar.gz. Работает на машине с интернетом.",
-        icon: "⬇",
-    },
-    CommandItem {
-        id: "install_updates",
-        name: "Установить обновления",
-        description: "Распаковывает архив school_packages.tar.gz (если есть) и устанавливает все обновления из папки. Работает без интернета.",
-        icon: "⬆",
-    },
-    CommandItem {
-        id: "download_packages",
-        name: "Скачать пакеты (task-koge)",
-        description: "Скачивает метапакет task-koge и все зависимости для экзамена по информатике + офисные программы. Создаёт архив.",
-        icon: "📦",
-    },
-    CommandItem {
-        id: "install_packages",
-        name: "Установить пакеты",
-        description: "Распаковывает архив и устанавливает все пакеты (task-koge, офис, редакторы). Работает без интернета.",
-        icon: "🚀",
-    },
-    CommandItem {
-        id: "detect_os",
-        name: "Информация о системе",
-        description: "Показывает определённую ОС, архитектуру и статус папок/архивов.",
-        icon: "ℹ",
-    },
-    CommandItem {
-        id: "exit",
-        name: "Выход",
-        description: "Завершить программу.",
-        icon: "✕",
-    },
+    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает все обновления в school_packages и создаёт архив. Нужен интернет.", icon: "⬇" },
+    CommandItem { id: "install_updates", name: "Установить обновления", description: "Распаковывает архив и ставит обновления офлайн.", icon: "⬆" },
+    CommandItem { id: "download_packages", name: "Скачать пакеты (task-koge)", description: "Скачивает task-koge + зависимости + офис. Создаёт архив.", icon: "📦" },
+    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Распаковывает архив и ставит весь софт офлайн.", icon: "🚀" },
+    CommandItem { id: "detect_os", name: "Информация о системе", description: "ОС, архитектура, размер папки и архива.", icon: "ℹ" },
+    CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕" },
 ];
 
 struct App {
@@ -369,138 +520,91 @@ struct App {
     archive_name: String,
     progress: f64,
     progress_label: String,
+    log_lines: Vec<String>,
+    log_rx: Option<mpsc::Receiver<LogEvent>>,
 }
 
 impl App {
     fn new() -> Self {
-        let os_type = detect_os();
-        let arch = detect_arch();
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         App {
             selected: 0,
             list_state,
-            status: "Готов к работе. Выберите команду.".to_string(),
+            status: "Готов к работе. Выберите команду (↑↓, Enter).".to_string(),
             is_running: false,
-            os_type,
-            arch,
+            os_type: detect_os(),
+            arch: detect_arch(),
             download_dir: "school_packages".to_string(),
             archive_name: "school_packages.tar.gz".to_string(),
             progress: 0.0,
             progress_label: String::new(),
+            log_lines: Vec::new(),
+            log_rx: None,
         }
     }
 
     fn next(&mut self) {
-        let i = if self.selected >= COMMANDS.len() - 1 {
-            0
-        } else {
-            self.selected + 1
-        };
-        self.selected = i;
-        self.list_state.select(Some(i));
+        if self.is_running { return; }
+        self.selected = if self.selected >= COMMANDS.len() - 1 { 0 } else { self.selected + 1 };
+        self.list_state.select(Some(self.selected));
     }
 
     fn previous(&mut self) {
-        let i = if self.selected == 0 {
-            COMMANDS.len() - 1
-        } else {
-            self.selected - 1
-        };
-        self.selected = i;
-        self.list_state.select(Some(i));
+        if self.is_running { return; }
+        self.selected = if self.selected == 0 { COMMANDS.len() - 1 } else { self.selected - 1 };
+        self.list_state.select(Some(self.selected));
     }
 
     fn execute_selected(&mut self) {
-        let cmd = &COMMANDS[self.selected];
+        if self.is_running { return; }
+        let cmd = COMMANDS[self.selected].clone();
         self.is_running = true;
         self.progress = 0.0;
         self.progress_label = format!("Выполняю: {}...", cmd.name);
         self.status = format!("▶ {}", cmd.name);
+        self.log_lines.clear();
 
-        // Явно указываем тип канала, чтобы компилятор не путался
-        let (tx, rx): (mpsc::Sender<(bool, String)>, mpsc::Receiver<(bool, String)>) = mpsc::channel();
+        let (tx, rx) = mpsc::channel::<LogEvent>();
         let os_type = self.os_type.clone();
         let download_dir = self.download_dir.clone();
         let archive_name = self.archive_name.clone();
-        let cmd_id = cmd.id.to_string();
 
         thread::spawn(move || {
-            let result: (bool, String) = match cmd_id.as_str() {
-                "download_updates" => {
-                    let (ok, msg) = download_updates(&download_dir, &os_type);
-                    if ok { compress_folder(&download_dir, &archive_name) } else { (false, msg) }
-                }
-                "install_updates" => {
-                    if Path::new(&archive_name).exists() {
-                        let (ok, msg) = decompress_archive(&archive_name, &download_dir);
-                        if !ok { return (false, msg); }
-                    } else if !Path::new(&download_dir).exists() {
-                        return (false, "Не найден ни архив, ни папка".to_string());
-                    }
-                    install_from_folder(&download_dir, &os_type)
-                }
-                "download_packages" => {
-                    let packages = get_packages();
-                    let (ok, msg) = download_packages(&packages, &download_dir, &os_type);
-                    if ok { compress_folder(&download_dir, &archive_name) } else { (false, msg) }
-                }
-                "install_packages" => {
-                    if Path::new(&archive_name).exists() {
-                        let (ok, msg) = decompress_archive(&archive_name, &download_dir);
-                        if !ok { return (false, msg); }
-                    } else if !Path::new(&download_dir).exists() {
-                        return (false, "Не найден ни архив, ни папка".to_string());
-                    }
-                    install_from_folder(&download_dir, &os_type)
-                }
-                "detect_os" => {
-                    let mut info = format!("ОС: {}\nАрхитектура: {}\n", os_type, detect_arch());
-                    info += &format!("Папка {}: {}\n", download_dir, Path::new(&download_dir).exists());
-                    info += &format!("Архив {}: {}\n", archive_name, Path::new(&archive_name).exists());
-                    if Path::new(&download_dir).exists() {
-                        let size = get_folder_size(&download_dir);
-                        info += &format!("Размер папки: {:.2} MB\n", size as f64 / 1024.0 / 1024.0);
-                    }
-                    if Path::new(&archive_name).exists() {
-                        if let Ok(meta) = fs::metadata(&archive_name) {
-                            info += &format!("Размер архива: {:.2} MB\n", meta.len() as f64 / 1024.0 / 1024.0);
-                        }
-                    }
-                    (true, info)
-                }
-                "exit" => (true, "Выход".to_string()),
-                _ => (false, "Неизвестная команда".to_string()),
-            };
-            
-            let _ = tx.send(result.clone());
-            result // <-- Возвращаем result, чтобы удовлетворить компилятор
+            run_command(cmd.id, os_type, download_dir, archive_name, &tx);
         });
 
-        loop {
-            match rx.try_recv() {
-                Ok((ok, msg)) => {
-                    self.progress = 1.0;
-                    self.progress_label = String::new();
-                    if ok {
-                        self.status = format!("✓ {}", msg);
-                    } else {
-                        self.status = format!("✗ {}", msg);
+        self.log_rx = Some(rx);
+    }
+
+    /// Вызывается из главного цикла: неблокирующе читает канал событий
+    fn poll_events(&mut self) {
+        let mut rx = self.log_rx.take();
+        if let Some(receiver) = &rx {
+            while let Ok(ev) = receiver.try_recv() {
+                match ev {
+                    LogEvent::Line(s) => {
+                        self.log_lines.push(s);
+                        if self.log_lines.len() > 400 {
+                            self.log_lines.remove(0);
+                        }
                     }
-                    self.is_running = false;
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.progress = (self.progress + 0.02).min(0.95);
-                    thread::sleep(Duration::from_millis(200));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.status = "Ошибка связи с потоком".to_string();
-                    self.is_running = false;
-                    break;
+                    LogEvent::Progress(p, label) => {
+                        self.progress = self.progress.max(p);
+                        self.progress_label = label;
+                    }
+                    LogEvent::Done(ok, msg) => {
+                        self.progress = 1.0;
+                        self.progress_label = String::new();
+                        self.status = if ok { format!("✓ {}", msg) } else { format!("✗ {}", msg) };
+                        self.is_running = false;
+                        rx = None;
+                        break;
+                    }
                 }
             }
         }
+        self.log_rx = rx;
     }
 }
 
@@ -515,30 +619,28 @@ fn ui(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let header = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(" ШКОЛЬНЫЙ УСТАНОВЩИК ПО ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(format!("ОС: {} | Арх: {}", app.os_type.to_uppercase(), app.arch), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        ]),
-    ])
+    // Шапка
+    let header = Paragraph::new(vec![Line::from(vec![
+        Span::styled(" ШКОЛЬНЫЙ УСТАНОВЩИК ПО ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(format!("ОС: {} | Арх: {}", app.os_type.to_uppercase(), app.arch), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+    ])])
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(header, chunks[0]);
 
+    // Две колонки
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[1]);
 
+    // Список команд
     let items: Vec<ListItem> = COMMANDS
         .iter()
         .enumerate()
         .map(|(i, cmd)| {
             let style = if i == app.selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else if app.is_running {
                 Style::default().fg(Color::DarkGray)
             } else {
@@ -552,65 +654,56 @@ fn ui(f: &mut Frame, app: &App) {
         .collect();
 
     let commands_list = List::new(items)
-        .block(
-            Block::default()
-                .title(" КОМАНДЫ (↑↓ навигация, Enter — выполнить, q — выход) ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .block(Block::default().title(" КОМАНДЫ (↑↓, Enter, q) ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
         .highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
 
+    // Правая колонка: описание сверху + лог снизу
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(0)])
+        .split(main_chunks[1]);
+
     let selected_cmd = &COMMANDS[app.selected];
-    let description_text = vec![
-        Line::from(""),
+    let desc = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Команда: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(selected_cmd.name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Описание:\n", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]),
         Line::from(selected_cmd.description),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Статус: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(app.status.as_str()), // <-- ИСПРАВЛЕНО: .as_str() вместо &app.status
-    ];
+    ])
+    .block(Block::default().title(" ОПИСАНИЕ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
+    .wrap(Wrap { trim: false });
+    f.render_widget(desc, right_chunks[0]);
 
-    let description = Paragraph::new(description_text)
-        .block(
-            Block::default()
-                .title(" ОПИСАНИЕ ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
+    // Лог
+    let log_widget = Paragraph::new(app.log_lines.clone())
+        .block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
         .wrap(Wrap { trim: false });
-    f.render_widget(description, main_chunks[1]);
+    // автоскролл: показываем последние строки
+    let height = right_chunks[1].height.saturating_sub(2) as usize;
+    let start = app.log_lines.len().saturating_sub(height);
+    f.render_widget(Paragraph::new(app.log_lines[start..].to_vec())
+        .block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
+        .wrap(Wrap { trim: false }), right_chunks[1]);
+    let _ = log_widget;
 
+    // Прогресс-бар
     let progress_width = (app.progress * 100.0) as u16;
-    let progress_bar = if app.is_running {
-        let filled = "█".repeat(progress_width as usize);
-        let empty = "░".repeat((100 - progress_width) as usize);
-        Paragraph::new(vec![Line::from(vec![
-            Span::styled(" Прогресс: ", Style::default().fg(Color::Cyan)),
-            Span::styled(format!("[{}{}]", filled, empty), Style::default().fg(Color::Green)),
-            Span::styled(format!(" {:.0}%", app.progress * 100.0), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {}", app.progress_label), Style::default().fg(Color::White)),
-        ])])
-    } else {
-        Paragraph::new(vec![Line::from(vec![
-            Span::styled(" Прогресс: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[████████████████████████████████████████████████████████████████████████████████]", Style::default().fg(Color::DarkGray)),
-            Span::styled(" 100%  Готов", Style::default().fg(Color::DarkGray)),
-        ])])
-    }
+    let filled = "█".repeat(progress_width as usize);
+    let empty = "░".repeat((100 - progress_width) as usize);
+    let pct_color = if app.progress >= 1.0 { Color::Green } else { Color::Yellow };
+    let progress_bar = Paragraph::new(vec![Line::from(vec![
+        Span::styled(" Прогресс: ", Style::default().fg(Color::Cyan)),
+        Span::styled(format!("[{}{}]", filled, empty), Style::default().fg(pct_color)),
+        Span::styled(format!(" {:.0}%", app.progress * 100.0), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}", app.progress_label), Style::default().fg(Color::White)),
+    ])])
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(progress_bar, chunks[2]);
 
+    // Статус
     let status_color = if app.status.starts_with("✓") {
         Color::Green
     } else if app.status.starts_with("✗") {
@@ -622,7 +715,7 @@ fn ui(f: &mut Frame, app: &App) {
     };
     let status_widget = Paragraph::new(vec![Line::from(vec![
         Span::styled(" Статус: ", Style::default().fg(Color::Cyan)),
-        Span::styled(app.status.as_str(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)), // <-- ИСПРАВЛЕНО
+        Span::styled(app.status.as_str(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
     ])])
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(status_widget, chunks[3]);
@@ -630,41 +723,41 @@ fn ui(f: &mut Frame, app: &App) {
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
+
+    // CLI-режим (обратная совместимость)
     if args.len() > 1 {
         let mode = args[1].trim_start_matches("--");
         let os_type = detect_os();
-        let download_dir = "school_packages";
-        let archive_name = "school_packages.tar.gz";
+        let download_dir = "school_packages".to_string();
+        let archive_name = "school_packages.tar.gz".to_string();
 
-        match mode {
-            "download-updates" => {
-                let (ok, msg) = download_updates(download_dir, &os_type);
-                if ok { compress_folder(download_dir, archive_name); }
-                println!("{}", msg);
+        let (tx, rx) = mpsc::channel::<LogEvent>();
+        let cmd_id = match mode {
+            "download-updates" => "download_updates",
+            "install-updates" => "install_updates",
+            "download-packages" => "download_packages",
+            "install-packages" => "install_packages",
+            _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
+        };
+        let (os_c, dd_c, an_c) = (os_type.clone(), download_dir.clone(), archive_name.clone());
+        thread::spawn(move || run_command(cmd_id, os_c, dd_c, an_c, &tx));
+
+        loop {
+            match rx.recv() {
+                Ok(LogEvent::Line(s)) => println!("{}", s),
+                Ok(LogEvent::Progress(p, l)) => println!("[{:>3.0}%] {}", p * 100.0, l),
+                Ok(LogEvent::Done(ok, msg)) => {
+                    println!("{}", msg);
+                    if !ok { std::process::exit(1); }
+                    break;
+                }
+                Err(_) => break,
             }
-            "install-updates" => {
-                if Path::new(archive_name).exists() { decompress_archive(archive_name, download_dir); }
-                let (ok, msg) = install_from_folder(download_dir, &os_type);
-                println!("{}", msg);
-                if !ok { std::process::exit(1); }
-            }
-            "download-packages" => {
-                let packages = get_packages();
-                let (ok, msg) = download_packages(&packages, download_dir, &os_type);
-                if ok { compress_folder(download_dir, archive_name); }
-                println!("{}", msg);
-            }
-            "install-packages" => {
-                if Path::new(archive_name).exists() { decompress_archive(archive_name, download_dir); }
-                let (ok, msg) = install_from_folder(download_dir, &os_type);
-                println!("{}", msg);
-                if !ok { std::process::exit(1); }
-            }
-            _ => println!("Неизвестная команда: {}", mode),
         }
         return Ok(());
     }
 
+    // TUI-режим
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -675,27 +768,22 @@ fn main() -> io::Result<()> {
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
+        app.poll_events();
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     break;
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if !app.is_running { app.previous(); }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !app.is_running { app.next(); }
-                    }
+                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                    KeyCode::Down | KeyCode::Char('j') => app.next(),
                     KeyCode::Enter => {
-                        if !app.is_running {
-                            if COMMANDS[app.selected].id == "exit" {
-                                break;
-                            }
-                            app.execute_selected();
+                        if COMMANDS[app.selected].id == "exit" {
+                            break;
                         }
+                        app.execute_selected();
                     }
                     _ => {}
                 }
@@ -704,12 +792,7 @@ fn main() -> io::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
-
     Ok(())
 }
