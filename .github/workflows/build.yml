@@ -1,0 +1,22 @@
+name: Build for MOS OS
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Install cross
+        run: cargo install cross
+        
+      - name: Build Linux binary (statically linked)
+        run: cross build --target x86_64-unknown-linux-musl --release
+        
+      - name: Upload ready-to-use binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: school-installer-linux
+          path: target/x86_64-unknown-linux-musl/release/school-installer
