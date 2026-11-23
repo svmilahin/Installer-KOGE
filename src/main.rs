@@ -603,7 +603,9 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
 
     if os_type == "rosa" {
         let mut cmd = Command::new(pm);
-        cmd.arg("download").arg("--resolve").arg("--alldeps").arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386").arg(format!("--destdir={}", download_dir));
+        cmd.arg("download").arg("--resolve").arg("--alldeps")
+            .arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386")
+            .arg(format!("--destdir={}", download_dir));
         for pkg in packages { cmd.arg(pkg); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, "Пакеты скачаны".to_string()),
@@ -611,16 +613,102 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
-        let total = packages.len(); let mut done = 0; let mut all_ok = true;
+        // Alt Linux: скачиваем по одному, копируем из кэша, пропускаем ненайденные
+        let cache_dir = "/var/cache/apt/archives";
+        let mut downloaded = 0;
+        let mut skipped = 0;
+        let mut failed = 0;
+
+        // Очищаем кэш перед скачиванием, чтобы потом скопировать только новые файлы
+        let _ = Command::new("rm").arg("-rf").arg(format!("{}/school-installer-tmp", cache_dir)).status();
+        let tmp_cache = format!("{}/school-installer-tmp", cache_dir);
+        let _ = fs::create_dir_all(&tmp_cache);
+
         for pkg in packages {
+            let _ = tx.send(LogEvent::Line(format!("Пробую скачать {}...", pkg)));
+
+            // Скачиваем во временный кэш
             let mut cmd = Command::new(pm);
-            cmd.arg("install").arg("--download-only").arg("-y").arg(format!("-o Dir::Cache::Archives={}", download_dir)).arg(pkg);
-            if let Ok(s) = run_process(cmd, tx) { if !s.success() { all_ok = false; } } else { all_ok = false; }
-            done += 1;
-            let _ = tx.send(LogEvent::Progress(done as f64 / total as f64, format!("{} / {}", done, total)));
+            cmd.arg("install")
+                .arg("--download-only")
+                .arg("-y")
+                .arg(format!("-o Dir::Cache::Archives={}", tmp_cache))
+                .arg(pkg);
+
+            match run_process(cmd, tx) {
+                Ok(s) if s.success() => {
+                    // Копируем все .rpm из временного кэша в целевую папку
+                    let copy_cmd = format!("find {} -name '*.rpm' -exec cp {{}} {}/ \\; 2>/dev/null", tmp_cache, download_dir);
+                    let _ = Command::new("sh").arg("-c").arg(&copy_cmd).status();
+
+                    // Проверяем, что что-то скопировалось
+                    let files = find_local_packages(download_dir, pkg, os_type);
+                    if !files.is_empty() {
+                        downloaded += 1;
+                        let _ = tx.send(LogEvent::Line(format!("[OK] {} скачан ({} файлов)", pkg, files.len())));
+                    } else {
+                        // Возможно пакет уже установлен — проверяем
+                        if is_package_installed(pkg, os_type) {
+                            skipped += 1;
+                            let _ = tx.send(LogEvent::Line(format!("[!] {} уже установлен — пропущен", pkg)));
+                        } else {
+                            skipped += 1;
+                            let _ = tx.send(LogEvent::Line(format!("[!] {} не найден в репозитории Alt Linux — пропущен", pkg)));
+                        }
+                    }
+
+                    // Очищаем временный кэш
+                    let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
+                    let _ = fs::create_dir_all(&tmp_cache);
+                }
+                Ok(s) => {
+                    // Пакет не найден — не фатальная ошибка
+                    skipped += 1;
+                    let _ = tx.send(LogEvent::Line(format!("[!] {} не найден в репозитории Alt Linux — пропущен", pkg)));
+                    let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
+                    let _ = fs::create_dir_all(&tmp_cache);
+                }
+                Err(e) => {
+                    failed += 1;
+                    let _ = tx.send(LogEvent::Line(format!("[X] Ошибка скачивания {}: {}", pkg, e)));
+                }
+            }
         }
-        if all_ok { (true, "Все пакеты скачаны".to_string()) } else { (false, "Некоторые пакеты не удалось скачать".to_string()) }
+
+        // Финальная очистка
+        let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
+
+        let mut msg = format!("Скачано: {}, пропущено: {}", downloaded, skipped);
+        if failed > 0 {
+            msg += &format!(", ошибок: {}", failed);
+        }
+
+        if downloaded > 0 || skipped > 0 {
+            (true, msg)
+        } else {
+            (false, msg)
+        }
     }
+}
+
+fn find_local_packages(folder: &str, pattern: &str, os_type: &str) -> Vec<String> {
+    let system_arch = detect_arch();
+    let extension = "rpm";
+    let mut found = Vec::new();
+    if let Ok(entries) = fs::read_dir(folder) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !name.ends_with(extension) { continue; }
+            if !name.starts_with(pattern) { continue; }
+            if !is_package_for_arch(&name, &system_arch) { continue; }
+            found.push(path.to_string_lossy().to_string());
+        }
+    }
+    found
 }
 
 // ==================== УСТАНОВКА ИЗ ПАПКИ ====================
