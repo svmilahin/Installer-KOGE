@@ -11,14 +11,91 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+// ==================== НАСТРОЙКИ ====================
+
+const SETTINGS_FILE: &str = "school-installer.conf";
+
+const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
+const DEFAULT_CERT_DIR: &str = "cer";
+const DEFAULT_CRYPTO_DIR: &str = "cryptopro_gia";
+const DEFAULT_SCHOOL_PACKAGES_DIR: &str = "school_packages";
+
+/// Загружает настройки из файла
+fn load_settings() -> HashMap<String, String> {
+    let mut settings = HashMap::new();
+    if let Ok(content) = fs::read_to_string(SETTINGS_FILE) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                settings.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+    }
+    settings
+}
+
+/// Сохраняет одну настройку в файл
+fn save_setting(key: &str, value: &str) -> io::Result<()> {
+    let mut settings = load_settings();
+    settings.insert(key.to_string(), value.to_string());
+
+    let mut content = String::from("# Настройки школьного установщика\n");
+    content += &format!("PROXY_URL={}\n", settings.get("PROXY_URL").map(|s| s.as_str()).unwrap_or(DEFAULT_PROXY_URL));
+    content += &format!("CERT_DIR={}\n", settings.get("CERT_DIR").map(|s| s.as_str()).unwrap_or(DEFAULT_CERT_DIR));
+    content += &format!("CRYPTO_DIR={}\n", settings.get("CRYPTO_DIR").map(|s| s.as_str()).unwrap_or(DEFAULT_CRYPTO_DIR));
+    content += &format!("SCHOOL_PACKAGES_DIR={}\n", settings.get("SCHOOL_PACKAGES_DIR").map(|s| s.as_str()).unwrap_or(DEFAULT_SCHOOL_PACKAGES_DIR));
+
+    fs::write(SETTINGS_FILE, content)
+}
+
+/// Получает значение настройки (CLI > env > файл > дефолт)
+fn get_setting(key: &str, default: &str) -> String {
+    // 1. Переменная окружения
+    let env_key = format!("SCHOOL_{}", key);
+    if let Ok(val) = env::var(&env_key) {
+        if !val.is_empty() {
+            return val;
+        }
+    }
+
+    // 2. Файл настроек
+    let settings = load_settings();
+    if let Some(val) = settings.get(key) {
+        return val.clone();
+    }
+
+    // 3. Дефолт
+    default.to_string()
+}
+
+fn get_proxy_url() -> String {
+    get_setting("PROXY_URL", DEFAULT_PROXY_URL)
+}
+
+fn get_cert_dir() -> String {
+    get_setting("CERT_DIR", DEFAULT_CERT_DIR)
+}
+
+fn get_crypto_dir() -> String {
+    get_setting("CRYPTO_DIR", DEFAULT_CRYPTO_DIR)
+}
+
+fn get_school_packages_dir() -> String {
+    get_setting("SCHOOL_PACKAGES_DIR", DEFAULT_SCHOOL_PACKAGES_DIR)
+}
 
 // ==================== СОБЫТИЯ ДЛЯ TUI ====================
 
@@ -44,7 +121,6 @@ fn clean_line(s: &str) -> String {
                 }
             }
         } else if c == '\r' {
-            // пропускаем
         } else {
             out.push(c);
         }
@@ -75,8 +151,6 @@ fn parse_progress(s: &str) -> Option<(u32, u32)> {
     best
 }
 
-/// Запуск процесса с перехватом.
-/// stdout -> лог; stderr -> лог + парсинг прогресса "[ a/b]".
 fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<ExitStatus> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -115,7 +189,18 @@ fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<Exit
     Ok(status)
 }
 
-// ==================== ЛОГИКА ОПРЕДЕЛЕНИЯ СИСТЕМЫ ====================
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {}", name))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// ==================== ОПРЕДЕЛЕНИЕ СИСТЕМЫ ====================
 
 fn detect_os() -> String {
     if let Ok(content) = fs::read_to_string("/etc/os-release") {
@@ -136,6 +221,25 @@ fn detect_arch() -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase().to_string())
         .unwrap_or_else(|_| "x86_64".to_string())
+}
+
+fn real_home_and_user() -> (String, Option<String>) {
+    if let Ok(user) = env::var("SUDO_USER") {
+        if !user.is_empty() {
+            if let Ok(out) = Command::new("getent").arg("passwd").arg(&user).output() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                if let Some(line) = s.lines().next() {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.len() >= 6 && !parts[5].is_empty() {
+                        return (parts[5].to_string(), Some(user));
+                    }
+                }
+            }
+            return (format!("/home/{}", user), Some(user));
+        }
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    (home, None)
 }
 
 fn get_folder_size(path: &str) -> u64 {
@@ -162,6 +266,174 @@ fn is_package_for_arch(filename: &str, system_arch: &str) -> bool {
         return false;
     }
     true
+}
+
+// ==================== ШАГ 1: НАСТРОЙКА ПРОКСИ ====================
+
+fn setup_proxy(os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let proxy_url = get_proxy_url();
+    let _ = tx.send(LogEvent::Line(format!("=== Настройка прокси {} ===", proxy_url)));
+
+    let profile_path = "/etc/profile.d/proxy.sh";
+    let profile_content = format!(
+        "# Автоматическая настройка прокси (school-installer)\nexport http_proxy=\"{u}\"\nexport https_proxy=\"{u}\"\nexport no_proxy=\"localhost,127.0.0.1,::1\"\n",
+        u = proxy_url
+    );
+    if let Err(e) = fs::write(profile_path, &profile_content) {
+        return (false, format!("Не удалось записать {}: {} (нужен root/sudo)", profile_path, e));
+    }
+    let _ = Command::new("chmod").arg("644").arg(profile_path).status();
+    let _ = tx.send(LogEvent::Line(format!("✅ {} создан", profile_path)));
+
+    if os_type == "rosa" {
+        let conf = "/etc/dnf/dnf.conf";
+        let content = fs::read_to_string(conf).unwrap_or_default();
+        let mut new_lines: Vec<String> = Vec::new();
+        let mut found = false;
+        let mut inserted_after_main = false;
+        for line in content.lines() {
+            if line.trim_start().starts_with("proxy=") {
+                new_lines.push(format!("proxy={}", proxy_url));
+                found = true;
+            } else {
+                new_lines.push(line.to_string());
+                if !found && !inserted_after_main && line.trim() == "[main]" {
+                    new_lines.push(format!("proxy={}", proxy_url));
+                    inserted_after_main = true;
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            new_lines.insert(0, "[main]".to_string());
+            new_lines.insert(1, format!("proxy={}", proxy_url));
+        }
+        if let Err(e) = fs::write(conf, new_lines.join("\n") + "\n") {
+            return (false, format!("Не удалось записать {}: {}", conf, e));
+        }
+        let _ = tx.send(LogEvent::Line(format!("✅ {} обновлён", conf)));
+    } else {
+        let dir = "/etc/apt/apt.conf.d";
+        let _ = fs::create_dir_all(dir);
+        let path = format!("{}/95proxy", dir);
+        let content = format!(
+            "Acquire::http::Proxy \"{}\";\nAcquire::https::Proxy \"{}\";\n",
+            proxy_url, proxy_url
+        );
+        if let Err(e) = fs::write(&path, &content) {
+            return (false, format!("Не удалось записать {}: {}", path, e));
+        }
+        let _ = tx.send(LogEvent::Line(format!("✅ {} создан", path)));
+    }
+
+    (true, "Прокси настроен".to_string())
+}
+
+// ==================== ШАГ 2: УСТАНОВКА СЕРТИФИКАТА ====================
+
+fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let _ = tx.send(LogEvent::Line(format!("=== Установка сертификатов из '{}' ===", cert_dir)));
+
+    if !Path::new(cert_dir).exists() {
+        let _ = tx.send(LogEvent::Line(format!("⚠ Папка '{}' не найдена — пропускаем сертификат", cert_dir)));
+        return (true, "Сертификат пропущен (нет папки)".to_string());
+    }
+
+    let mut certs: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(cert_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if (ext == "crt" || ext == "pem") && path.is_file() {
+                certs.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    if certs.is_empty() {
+        let _ = tx.send(LogEvent::Line(format!("⚠ В '{}' нет .crt/.pem — пропускаем", cert_dir)));
+        return (true, "Сертификат пропущен (пусто)".to_string());
+    }
+
+    let _ = tx.send(LogEvent::Line(format!("Найдено сертификатов: {}", certs.len())));
+
+    let anchors_dir = "/etc/pki/ca-trust/source/anchors";
+    let _ = fs::create_dir_all(anchors_dir);
+    for cert in &certs {
+        let name = Path::new(cert).file_name().unwrap_or_default().to_string_lossy().to_string();
+        let dst = format!("{}/{}", anchors_dir, name);
+        if let Err(e) = fs::copy(cert, &dst) {
+            return (false, format!("Не удалось скопировать {} в {}: {}", cert, dst, e));
+        }
+        let _ = tx.send(LogEvent::Line(format!("   → {}", dst)));
+    }
+    if command_exists("update-ca-trust") {
+        let _ = tx.send(LogEvent::Line("Запускаю update-ca-trust...".to_string()));
+        let mut cmd = Command::new("update-ca-trust");
+        match run_process(cmd, tx) {
+            Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line("✅ Системное хранилище обновлено".to_string())); }
+            Ok(s) => return (false, format!("update-ca-trust завершился с ошибкой. Код: {:?}", s.code())),
+            Err(e) => return (false, format!("Не удалось запустить update-ca-trust: {}", e)),
+        }
+    } else {
+        let _ = tx.send(LogEvent::Line("⚠ update-ca-trust не найден — пропускаю системное хранилище".to_string()));
+    }
+
+    let (home, real_user) = real_home_and_user();
+    let nssdb = format!("sql:{}/.pki/nssdb", home);
+
+    if !command_exists("certutil") {
+        let _ = tx.send(LogEvent::Line("certutil нет — ставлю nss-tools...".to_string()));
+        let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
+        let mut ok = false;
+        for pkg in ["nss-tools", "libnss3-tools"] {
+            let mut cmd = Command::new(pm);
+            cmd.arg("install").arg("-y").arg(pkg);
+            if let Ok(s) = run_process(cmd, tx) {
+                if s.success() { ok = true; break; }
+            }
+        }
+        if !ok {
+            let _ = tx.send(LogEvent::Line("⚠ Не удалось установить nss-tools — пропускаю NSS".to_string()));
+            return (true, "Сертификат в системное хранилище (NSS пропущен)".to_string());
+        }
+    }
+
+    let _ = fs::create_dir_all(format!("{}/.pki/nssdb", home));
+    let mut init = Command::new("certutil");
+    init.arg("-d").arg(&nssdb).arg("-N").arg("--empty-password");
+    let _ = init.status();
+
+    for cert in &certs {
+        let nick = Path::new(cert).file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let mut del = Command::new("certutil");
+        del.arg("-d").arg(&nssdb).arg("-D").arg("-n").arg(&nick);
+        let _ = del.status();
+        let mut add = Command::new("certutil");
+        add.arg("-d").arg(&nssdb).arg("-A").arg("-t").arg("C,,").arg("-n").arg(&nick).arg("-i").arg(cert);
+        match run_process(add, tx) {
+            Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {}", nick))); }
+            _ => { let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS не добавлен: {}", nick))); }
+        }
+    }
+
+    if let Some(user) = real_user {
+        let mut ch = Command::new("chown");
+        ch.arg("-R").arg(format!("{}:{}", user, user)).arg(format!("{}/.pki", home));
+        let _ = ch.status();
+        let _ = tx.send(LogEvent::Line(format!("   ✅ chown .pki → {}", user)));
+    }
+
+    (true, format!("Сертификатов установлено: {}", certs.len()))
+}
+
+fn prepare_environment(os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let (ok1, m1) = setup_proxy(os_type, tx);
+    if !ok1 { return (false, format!("Прокси: {}", m1)); }
+    let cert_dir = get_cert_dir();
+    let (ok2, m2) = install_cert(&cert_dir, os_type, tx);
+    if !ok2 { return (false, format!("Сертификат: {}", m2)); }
+    (true, format!("Прокси ✓ | {}", m2))
 }
 
 // ==================== СКАЧИВАНИЕ ====================
@@ -224,7 +496,7 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
     }
 }
 
-// ==================== УСТАНОВКА ИЗ ПАПКИ (обычные пакеты / ГИА) ====================
+// ==================== УСТАНОВКА ИЗ ПАПКИ ====================
 
 fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
@@ -238,12 +510,9 @@ fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogE
         }).collect(),
         Err(e) => return (false, format!("Ошибка чтения папки: {}", e)),
     };
-
     if all_files.is_empty() { return (false, format!("В папке '{}' не найдено .{} файлов", download_dir, extension)); }
-
     let files: Vec<String> = all_files.into_iter().filter(|f| is_package_for_arch(f, &system_arch)).collect();
     if files.is_empty() { return (false, format!("Нет пакетов под архитектуру {}", system_arch)); }
-
     let _ = tx.send(LogEvent::Line(format!("Найдено {} пакетов для установки", files.len())));
 
     if os_type == "rosa" {
@@ -269,19 +538,14 @@ fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogE
 
 // ==================== КРИПТОПРО + ГИА ====================
 
-/// Ищет локальные .rpm/.deb файлы по паттерну имени
 fn find_local_packages(folder: &str, pattern: &str, os_type: &str) -> Vec<String> {
     let system_arch = detect_arch();
     let extension = if os_type == "rosa" { "rpm" } else { "deb" };
     let mut found = Vec::new();
-
     if let Ok(entries) = fs::read_dir(folder) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) {
-                Some(n) => n,
-                None => continue,
-            };
+            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) { Some(n) => n, None => continue };
             if !name.ends_with(extension) { continue; }
             if !name.starts_with(pattern) { continue; }
             if !is_package_for_arch(&name, &system_arch) { continue; }
@@ -291,20 +555,13 @@ fn find_local_packages(folder: &str, pattern: &str, os_type: &str) -> Vec<String
     found
 }
 
-/// Скачивает пакет из репозитория и сохраняет в папку
 fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(folder);
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
-
     let _ = tx.send(LogEvent::Line(format!("Скачиваю {} из репозитория...", package_name)));
-
     if os_type == "rosa" {
         let mut cmd = Command::new(pm);
-        cmd.arg("download")
-            .arg("--resolve")
-            .arg("--alldeps")
-            .arg(format!("--destdir={}", folder))
-            .arg(package_name);
+        cmd.arg("download").arg("--resolve").arg("--alldeps").arg(format!("--destdir={}", folder)).arg(package_name);
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, format!("{} скачан", package_name)),
             Ok(s) => (false, format!("Ошибка скачивания {}. Код: {:?}", package_name, s.code())),
@@ -312,11 +569,7 @@ fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, t
         }
     } else {
         let mut cmd = Command::new(pm);
-        cmd.arg("install")
-            .arg("--download-only")
-            .arg("-y")
-            .arg(format!("-o Dir::Cache::Archives={}", folder))
-            .arg(package_name);
+        cmd.arg("install").arg("--download-only").arg("-y").arg(format!("-o Dir::Cache::Archives={}", folder)).arg(package_name);
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, format!("{} скачан", package_name)),
             Ok(s) => (false, format!("Ошибка скачивания {}. Код: {:?}", package_name, s.code())),
@@ -325,17 +578,11 @@ fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, t
     }
 }
 
-/// Устанавливает локальные .rpm/.deb файлы по паттерну
 fn install_local_packages(folder: &str, pattern: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let files = find_local_packages(folder, pattern, os_type);
-    if files.is_empty() {
-        return (false, format!("Не найдено {}*.rpm в папке {}", pattern, folder));
-    }
-
+    if files.is_empty() { return (false, format!("Не найдено {}*.rpm в папке {}", pattern, folder)); }
     let _ = tx.send(LogEvent::Line(format!("Устанавливаю {} пакетов: {}", files.len(), pattern)));
-
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
-
     if os_type == "rosa" {
         let mut cmd = Command::new(pm);
         cmd.arg("install").arg("-y").arg("--allowerasing").arg("--nobest");
@@ -357,23 +604,14 @@ fn install_local_packages(folder: &str, pattern: &str, os_type: &str, tx: &mpsc:
     }
 }
 
-/// Устанавливает КриптоПро через родной install.sh из linux-amd64/
 fn install_cryptopro_csp(crypto_subdir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let install_script = Path::new(crypto_subdir).join("install.sh");
     let uninstall_script = Path::new(crypto_subdir).join("uninstall.sh");
-
-    if !install_script.exists() {
-        return (false, "В linux-amd64/ не найден install.sh КриптоПро".to_string());
-    }
-    if !uninstall_script.exists() {
-        return (false, "В linux-amd64/ не найден uninstall.sh КриптоПро".to_string());
-    }
-
+    if !install_script.exists() { return (false, "В linux-amd64/ не найден install.sh КриптоПро".to_string()); }
+    if !uninstall_script.exists() { return (false, "В linux-amd64/ не найден uninstall.sh КриптоПро".to_string()); }
     let _ = tx.send(LogEvent::Line("Запускаю install.sh КриптоПро (kc1, --yes)...".to_string()));
-
     let mut cmd = Command::new("sh");
     cmd.current_dir(crypto_subdir).arg("./install.sh").arg("kc1").arg("--yes");
-
     match run_process(cmd, tx) {
         Ok(s) if s.success() => (true, "КриптоПро CSP установлен".to_string()),
         Ok(s) => (false, format!("install.sh завершился с ошибкой. Код: {:?}", s.code())),
@@ -381,57 +619,72 @@ fn install_cryptopro_csp(crypto_subdir: &str, os_type: &str, tx: &mpsc::Sender<L
     }
 }
 
-/// Главный пункт: КриптоПро + ГИА (4 шага)
 fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(crypto_dir);
     let _ = fs::create_dir_all(school_dir);
 
     // --- ШАГ 1: newt ---
-    let _ = tx.send(LogEvent::Line("=== ШАГ 1/4: newt ===".to_string()));
+    let _ = tx.send(LogEvent::Line("=== ШАГ 1/5: newt ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.0, "Шаг 1: newt...".to_string()));
-    
-    let newt_files = find_local_packages(crypto_dir, "newt", os_type);
-    if newt_files.is_empty() {
+    if find_local_packages(crypto_dir, "newt", os_type).is_empty() {
         let _ = tx.send(LogEvent::Line("newt не найден локально — скачиваю из репозитория...".to_string()));
         let (ok, msg) = download_package_to_folder("newt", crypto_dir, os_type, tx);
-        if !ok { return (false, format!("Шаг 1 (newt) не выполнен: {}", msg)); }
+        if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
     }
     let (ok, msg) = install_local_packages(crypto_dir, "newt", os_type, tx);
-    if !ok { return (false, format!("Шаг 1 (newt) не выполнен: {}", msg)); }
+    if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
 
-    // --- ШАГ 2: librtpkcs11ecp ---
-    let _ = tx.send(LogEvent::Line("=== ШАГ 2/4: librtpkcs11ecp ===".to_string()));
-    let _ = tx.send(LogEvent::Progress(0.25, "Шаг 2: librtpkcs11ecp...".to_string()));
-    
-    let librtpkcs11ecp_files = find_local_packages(crypto_dir, "librtpkcs11ecp", os_type);
-    if librtpkcs11ecp_files.is_empty() {
-        let _ = tx.send(LogEvent::Line("librtpkcs11ecp не найден локально — скачиваю с зависимостями...".to_string()));
+    // --- ШАГ 2.1: pcsc-lite (зависимость для librtpkcs11ecp) ---
+    let _ = tx.send(LogEvent::Line("=== ШАГ 2.1/5: pcsc-lite + pcsc-lite-ccid ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.15, "Шаг 2.1: pcsc-lite...".to_string()));
+    for pkg in &["pcsc-lite", "pcsc-lite-ccid"] {
+        if find_local_packages(crypto_dir, pkg, os_type).is_empty() {
+            let _ = tx.send(LogEvent::Line(format!("{} не найден — скачиваю из репозитория...", pkg)));
+            let (ok, msg) = download_package_to_folder(pkg, crypto_dir, os_type, tx);
+            if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
+        }
+        let (ok, msg) = install_local_packages(crypto_dir, pkg, os_type, tx);
+        if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
+    }
+
+    // --- ШАГ 2.2: librtpkcs11ecp ---
+    let _ = tx.send(LogEvent::Line("=== ШАГ 2.2/5: librtpkcs11ecp ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.3, "Шаг 2.2: librtpkcs11ecp...".to_string()));
+    if find_local_packages(crypto_dir, "librtpkcs11ecp", os_type).is_empty() {
+        let _ = tx.send(LogEvent::Line("librtpkcs11ecp не найден — скачиваю с зависимостями...".to_string()));
         let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, os_type, tx);
-        if !ok { return (false, format!("Шаг 2 (librtpkcs11ecp) не выполнен: {}", msg)); }
+        if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
     }
     let (ok, msg) = install_local_packages(crypto_dir, "librtpkcs11ecp", os_type, tx);
-    if !ok { return (false, format!("Шаг 2 (librtpkcs11ecp) не выполнен: {}", msg)); }
+    if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
 
     // --- ШАГ 3: КриптоПро CSP ---
-    let _ = tx.send(LogEvent::Line("=== ШАГ 3/4: КриптоПро CSP ===".to_string()));
+    let _ = tx.send(LogEvent::Line("=== ШАГ 3/5: КриптоПро CSP ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.5, "Шаг 3: КриптоПро...".to_string()));
-    
     let crypto_subdir = Path::new(crypto_dir).join("linux-amd64");
     let (ok, msg) = install_cryptopro_csp(&crypto_subdir.to_string_lossy(), os_type, tx);
-    if !ok { return (false, format!("Шаг 3 (КриптоПро) не выполнен: {}", msg)); }
+    if !ok { return (false, format!("Шаг 3 (КриптоПро): {}", msg)); }
 
-    // --- ШАГ 4: GIA11_PPE (только локально) ---
-    let _ = tx.send(LogEvent::Line("=== ШАГ 4/4: GIA11_PPE ===".to_string()));
+    // --- ШАГ 4: GIA11_PPE ---
+    let _ = tx.send(LogEvent::Line("=== ШАГ 4/5: GIA11_PPE ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.75, "Шаг 4: GIA11_PPE...".to_string()));
-    
-    let gia_files = find_local_packages(crypto_dir, "GIA11_PPE", os_type);
-    if gia_files.is_empty() {
-        return (false, "GIA11_PPE*.rpm не найден в папке cryptopro_gia. Положите файл и повторите.".to_string());
+    if find_local_packages(crypto_dir, "GIA11_PPE", os_type).is_empty() {
+        return (false, "GIA11_PPE*.rpm не найден в cryptopro_gia. Положите файл и повторите.".to_string());
     }
     let (ok, msg) = install_local_packages(crypto_dir, "GIA11_PPE", os_type, tx);
-    if !ok { return (false, format!("Шаг 4 (GIA11_PPE) не выполнен: {}", msg)); }
+    if !ok { return (false, format!("Шаг 4 (GIA11_PPE): {}", msg)); }
 
-    (true, "Все компоненты установлены: newt, librtpkcs11ecp, КриптоПро CSP, GIA11_PPE".to_string())
+    // --- ШАГ 5: Запуск pcscd (демон смарт-карт) ---
+    let _ = tx.send(LogEvent::Line("=== ШАГ 5/5: Запуск pcscd ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.9, "Шаг 5: запуск pcscd...".to_string()));
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("enable").arg("--now").arg("pcscd");
+    match run_process(cmd, tx) {
+        Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line("✅ pcscd запущен и добавлен в автозагрузку".to_string())); }
+        _ => { let _ = tx.send(LogEvent::Line("⚠ Не удалось запустить pcscd — запустите вручную: systemctl enable --now pcscd".to_string())); }
+    }
+
+    (true, "Установлено: newt, pcsc-lite, librtpkcs11ecp, КриптоПро CSP, GIA11_PPE".to_string())
 }
 
 fn get_packages() -> Vec<&'static str> {
@@ -440,38 +693,53 @@ fn get_packages() -> Vec<&'static str> {
 
 // ==================== ДИСПЕТЧЕР КОМАНД ====================
 
-fn run_command(cmd_id: &str, os_type: String, download_dir: String, tx: &mpsc::Sender<LogEvent>) {
+fn run_command(cmd_id: &str, os_type: String, tx: &mpsc::Sender<LogEvent>) {
+    let needs_prepare = matches!(cmd_id,
+        "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia");
+    if needs_prepare {
+        let (ok, msg) = prepare_environment(&os_type, tx);
+        if !ok {
+            let _ = tx.send(LogEvent::Done(false, format!("Подготовка окружения: {}", msg)));
+            return;
+        }
+    }
+
+    let download_dir = get_school_packages_dir();
+    let cert_dir = get_cert_dir();
+    let crypto_dir = get_crypto_dir();
+
     let result: (bool, String) = match cmd_id {
+        "setup_env" => prepare_environment(&os_type, tx),
         "download_updates" => download_updates(&download_dir, &os_type, tx),
         "install_updates" => {
             if !Path::new(&download_dir).exists() {
                 (false, "Папка не найдена. Сначала скачайте обновления.".to_string())
-            } else {
-                install_from_folder(&download_dir, &os_type, tx)
-            }
+            } else { install_from_folder(&download_dir, &os_type, tx) }
         }
-        "download_packages" => {
-            let packages = get_packages();
-            download_packages(&packages, &download_dir, &os_type, tx)
-        }
+        "download_packages" => download_packages(&get_packages(), &download_dir, &os_type, tx),
         "install_packages" => {
             if !Path::new(&download_dir).exists() {
                 (false, "Папка не найдена. Сначала скачайте пакеты.".to_string())
-            } else {
-                install_from_folder(&download_dir, &os_type, tx)
-            }
+            } else { install_from_folder(&download_dir, &os_type, tx) }
         }
-        "install_cryptopro_gia" => install_cryptopro_gia("cryptopro_gia", &download_dir, &os_type, tx),
+        "install_cryptopro_gia" => install_cryptopro_gia(&crypto_dir, &download_dir, &os_type, tx),
         "detect_os" => {
-            let mut info = format!("ОС: {} | Архитектура: {}", os_type, detect_arch());
-            info += &format!(" | school_packages: {}", Path::new(&download_dir).exists());
-            info += &format!(" | cryptopro_gia: {}", Path::new("cryptopro_gia").exists());
-            info += &format!(" | install.sh: {}", Path::new("cryptopro_gia/linux-amd64/install.sh").exists());
+            let mut info = format!("ОС: {} | Арх: {}", os_type, detect_arch());
+            info += &format!("\n\nТекущие настройки:");
+            info += &format!("\n  Прокси: {}", get_proxy_url());
+            info += &format!("\n  Папка сертификатов: {}", cert_dir);
+            info += &format!("\n  Папка КриптоПро: {}", crypto_dir);
+            info += &format!("\n  Папка пакетов: {}", download_dir);
+            info += &format!("\n\nПапки:");
+            info += &format!("\n  school_packages: {}", Path::new(&download_dir).exists());
+            info += &format!("\n  cryptopro_gia: {}", Path::new(&crypto_dir).exists());
+            info += &format!("\n  cer: {}", Path::new(&cert_dir).exists());
+            info += &format!("\n  install.sh: {}", Path::new(&format!("{}/linux-amd64/install.sh", crypto_dir)).exists());
             if Path::new(&download_dir).exists() {
-                info += &format!(" | размер school_packages: {:.2} MB", get_folder_size(&download_dir) as f64 / 1024.0 / 1024.0);
+                info += &format!("\n  school_packages: {:.2} MB", get_folder_size(&download_dir) as f64 / 1048576.0);
             }
-            if Path::new("cryptopro_gia").exists() {
-                info += &format!(" | размер cryptopro_gia: {:.2} MB", get_folder_size("cryptopro_gia") as f64 / 1024.0 / 1024.0);
+            if Path::new(&crypto_dir).exists() {
+                info += &format!("\n  cryptopro_gia: {:.2} MB", get_folder_size(&crypto_dir) as f64 / 1048576.0);
             }
             (true, info)
         }
@@ -492,12 +760,13 @@ struct CommandItem {
 }
 
 const COMMANDS: &[CommandItem] = &[
-    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает все обновления в папку 'school_packages'. Нужен интернет.", icon: "⬇" },
-    CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает обновления из 'school_packages' офлайн.", icon: "⬆" },
-    CommandItem { id: "download_packages", name: "Скачать пакеты (task-koge)", description: "Скачивает task-koge + зависимости + офис в 'school_packages'.", icon: "📦" },
-    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает пакеты из 'school_packages' офлайн.", icon: "🚀" },
-    CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "4 шага: newt → librtpkcs11ecp → КриптоПро (install.sh из linux-amd64/) → GIA11_PPE. Если newt/librtpkcs11ecp нет локально — скачивает из репо.", icon: "🔐" },
-    CommandItem { id: "detect_os", name: "Информация о системе", description: "ОС, архитектура, наличие папок и install.sh, размеры.", icon: "ℹ" },
+    CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "ШАГ 1: прокси (из настроек) в dnf.conf/apt.conf + /etc/profile.d/proxy.sh. ШАГ 2: сертификаты из папки 'cer' (или из настроек) в системное хранилище и NSS-базу Chromium.", icon: "🌐" },
+    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Прокси+сертификат → скачивает обновления в папку пакетов. Нужен интернет.", icon: "⬇" },
+    CommandItem { id: "install_updates", name: "Установить обновления", description: "Прокси+сертификат → устанавливает из папки пакетов офлайн.", icon: "⬆" },
+    CommandItem { id: "download_packages", name: "Скачать пакеты (task-koge)", description: "Прокси+сертификат → скачивает task-koge + зависимости + офис.", icon: "📦" },
+    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Прокси+сертификат → устанавливает из папки пакетов офлайн.", icon: "🚀" },
+    CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "Прокси+сертификат → 4 шага: newt → librtpkcs11ecp → КриптоПро → GIA11_PPE.", icon: "🔐" },
+    CommandItem { id: "detect_os", name: "Информация о системе", description: "ОС, архитектура, текущие настройки, наличие папок и install.sh, размеры.", icon: "ℹ" },
     CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕" },
 ];
 
@@ -508,7 +777,6 @@ struct App {
     is_running: bool,
     os_type: String,
     arch: String,
-    download_dir: String,
     progress: f64,
     progress_label: String,
     log_lines: Vec<String>,
@@ -524,24 +792,20 @@ impl App {
             status: "Готов к работе. Выберите команду (↑↓, Enter).".to_string(),
             is_running: false,
             os_type: detect_os(), arch: detect_arch(),
-            download_dir: "school_packages".to_string(),
             progress: 0.0, progress_label: String::new(),
             log_lines: Vec::new(), log_rx: None,
         }
     }
-
     fn next(&mut self) {
         if self.is_running { return; }
         self.selected = if self.selected >= COMMANDS.len() - 1 { 0 } else { self.selected + 1 };
         self.list_state.select(Some(self.selected));
     }
-
     fn previous(&mut self) {
         if self.is_running { return; }
         self.selected = if self.selected == 0 { COMMANDS.len() - 1 } else { self.selected - 1 };
         self.list_state.select(Some(self.selected));
     }
-
     fn execute_selected(&mut self) {
         if self.is_running { return; }
         let cmd = COMMANDS[self.selected].clone();
@@ -550,18 +814,11 @@ impl App {
         self.progress_label = format!("Выполняю: {}...", cmd.name);
         self.status = format!("▶ {}", cmd.name);
         self.log_lines.clear();
-
         let (tx, rx) = mpsc::channel::<LogEvent>();
         let os_type = self.os_type.clone();
-        let download_dir = self.download_dir.clone();
-
-        thread::spawn(move || {
-            run_command(cmd.id, os_type, download_dir, &tx);
-        });
-
+        thread::spawn(move || { run_command(cmd.id, os_type, &tx); });
         self.log_rx = Some(rx);
     }
-
     fn poll_events(&mut self) {
         let mut rx = self.log_rx.take();
         if let Some(receiver) = &rx {
@@ -571,10 +828,7 @@ impl App {
                         self.log_lines.push(s);
                         if self.log_lines.len() > 600 { self.log_lines.remove(0); }
                     }
-                    LogEvent::Progress(p, label) => {
-                        self.progress = p;
-                        self.progress_label = label;
-                    }
+                    LogEvent::Progress(p, label) => { self.progress = p; self.progress_label = label; }
                     LogEvent::Done(ok, msg) => {
                         self.progress = 1.0;
                         self.progress_label = String::new();
@@ -649,7 +903,6 @@ fn ui(f: &mut Frame, app: &App) {
     let height = right_chunks[1].height.saturating_sub(2) as usize;
     let start = app.log_lines.len().saturating_sub(height);
     let log_text = app.log_lines[start..].join("\n");
-
     let log_widget = Paragraph::new(log_text)
         .block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
         .wrap(Wrap { trim: false });
@@ -680,14 +933,87 @@ fn ui(f: &mut Frame, app: &App) {
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    // CLI-режим
+    // CLI-режим для управления настройками
+    if args.len() >= 2 {
+        let mode = args[1].trim_start_matches("--");
+        match mode {
+            "set-proxy" => {
+                if args.len() < 3 {
+                    println!("Использование: --set-proxy <URL>");
+                    println!("Пример: --set-proxy http://10.0.54.52:3128");
+                    return Ok(());
+                }
+                let url = &args[2];
+                save_setting("PROXY_URL", url)?;
+                println!("✅ Прокси установлен: {}", url);
+                println!("   Файл настроек: {}", SETTINGS_FILE);
+                return Ok(());
+            }
+            "set-cert-dir" => {
+                if args.len() < 3 {
+                    println!("Использование: --set-cert-dir <PATH>");
+                    println!("Пример: --set-cert-dir /media/usb/certificates");
+                    return Ok(());
+                }
+                let path = &args[2];
+                save_setting("CERT_DIR", path)?;
+                println!("✅ Папка сертификатов: {}", path);
+                return Ok(());
+            }
+            "set-crypto-dir" => {
+                if args.len() < 3 {
+                    println!("Использование: --set-crypto-dir <PATH>");
+                    return Ok(());
+                }
+                let path = &args[2];
+                save_setting("CRYPTO_DIR", path)?;
+                println!("✅ Папка КриптоПро: {}", path);
+                return Ok(());
+            }
+            "set-packages-dir" => {
+                if args.len() < 3 {
+                    println!("Использование: --set-packages-dir <PATH>");
+                    return Ok(());
+                }
+                let path = &args[2];
+                save_setting("SCHOOL_PACKAGES_DIR", path)?;
+                println!("✅ Папка пакетов: {}", path);
+                return Ok(());
+            }
+            "show-settings" => {
+                println!("=== Текущие настройки ===\n");
+                println!("Файл: {}", SETTINGS_FILE);
+                println!("Прокси: {}", get_proxy_url());
+                println!("Папка сертификатов: {}", get_cert_dir());
+                println!("Папка КриптоПро: {}", get_crypto_dir());
+                println!("Папка пакетов: {}", get_school_packages_dir());
+                println!("\n=== Приоритет настроек ===");
+                println!("1. CLI-аргументы (этот запуск)");
+                println!("2. Переменные окружения (SCHOOL_PROXY_URL, SCHOOL_CERT_DIR, ...)");
+                println!("3. Файл настроек ({})", SETTINGS_FILE);
+                println!("4. Значения по умолчанию");
+                return Ok(());
+            }
+            "reset-settings" => {
+                let _ = fs::remove_file(SETTINGS_FILE);
+                println!("✅ Настройки сброшены к значениям по умолчанию");
+                println!("   Прокси: {}", DEFAULT_PROXY_URL);
+                println!("   Папка сертификатов: {}", DEFAULT_CERT_DIR);
+                println!("   Папка КриптоПро: {}", DEFAULT_CRYPTO_DIR);
+                println!("   Папка пакетов: {}", DEFAULT_SCHOOL_PACKAGES_DIR);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // CLI-режим для рабочих команд
     if args.len() > 1 {
         let mode = args[1].trim_start_matches("--");
         let os_type = detect_os();
-        let download_dir = "school_packages".to_string();
-
         let (tx, rx) = mpsc::channel::<LogEvent>();
         let cmd_id = match mode {
+            "setup-env" => "setup_env",
             "download-updates" => "download_updates",
             "install-updates" => "install_updates",
             "download-packages" => "download_packages",
@@ -695,9 +1021,8 @@ fn main() -> io::Result<()> {
             "install-crypto-gia" => "install_cryptopro_gia",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
-        let (os_c, dd_c) = (os_type.clone(), download_dir.clone());
-        thread::spawn(move || run_command(cmd_id, os_c, dd_c, &tx));
-
+        let os_c = os_type.clone();
+        thread::spawn(move || run_command(cmd_id, os_c, &tx));
         loop {
             match rx.recv() {
                 Ok(LogEvent::Line(s)) => println!("{}", s),
@@ -719,13 +1044,10 @@ fn main() -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
     let mut app = App::new();
-
     loop {
         terminal.draw(|f| ui(f, &app))?;
         app.poll_events();
-
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { break; }
@@ -742,7 +1064,6 @@ fn main() -> io::Result<()> {
             }
         }
     }
-
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
