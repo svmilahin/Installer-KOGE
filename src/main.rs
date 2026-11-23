@@ -335,7 +335,7 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
     let _ = tx.send(LogEvent::Line(format!("=== Установка сертификатов из '{}' ===", cert_dir)));
 
     if !Path::new(cert_dir).exists() {
-        let _ = tx.send(LogEvent::Line(format!("⚠ Папка '{}' не найдена — пропускаем сертификат", cert_dir)));
+        let _ = tx.send(LogEvent::Line(format!("⚠ Папка '{}' не найдена — пропускаем", cert_dir)));
         return (true, "Сертификат пропущен (нет папки)".to_string());
     }
 
@@ -343,20 +343,46 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
     if let Ok(entries) = fs::read_dir(cert_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if (ext == "crt" || ext == "pem") && path.is_file() {
-                certs.push(path.to_string_lossy().to_string());
+
+            // ❌ Пропускаем macOS resource forks (._*)
+            if name.starts_with("._") {
+                let _ = tx.send(LogEvent::Line(format!("   ⚠ Пропущен macOS-файл: {}", name)));
+                continue;
             }
+            if ext != "crt" && ext != "pem" && ext != "cer" { continue; }
+            if !path.is_file() { continue; }
+
+            // ❌ Пропускаем файлы меньше 100 байт (не могут быть сертификатами)
+            if let Ok(meta) = fs::metadata(&path) {
+                if meta.len() < 100 {
+                    let _ = tx.send(LogEvent::Line(format!("   ⚠ Пропущен слишком маленький файл: {} ({} байт)", name, meta.len())));
+                    continue;
+                }
+            }
+
+            // ❌ Проверяем содержимое: должен быть PEM или DER
+            let content = fs::read(&path).unwrap_or_default();
+            let is_pem = content.starts_with(b"-----BEGIN CERTIFICATE-----");
+            let is_der = content.len() > 2 && content[0] == 0x30 && (content[1] == 0x82 || content[1] == 0x81);
+            if !is_pem && !is_der {
+                let _ = tx.send(LogEvent::Line(format!("   ⚠ Пропущен невалидный файл (не PEM/DER): {}", name)));
+                continue;
+            }
+
+            certs.push(path.to_string_lossy().to_string());
         }
     }
 
     if certs.is_empty() {
-        let _ = tx.send(LogEvent::Line(format!("⚠ В '{}' нет .crt/.pem — пропускаем", cert_dir)));
-        return (true, "Сертификат пропущен (пусто)".to_string());
+        let _ = tx.send(LogEvent::Line(format!("⚠ В '{}' нет валидных .crt/.pem — пропускаем", cert_dir)));
+        return (true, "Сертификат пропущен (нет валидных файлов)".to_string());
     }
 
-    let _ = tx.send(LogEvent::Line(format!("Найдено сертификатов: {}", certs.len())));
+    let _ = tx.send(LogEvent::Line(format!("Найдено валидных сертификатов: {}", certs.len())));
 
+    // === 1. Системное хранилище ===
     let anchors_dir = "/etc/pki/ca-trust/source/anchors";
     let _ = fs::create_dir_all(anchors_dir);
     for cert in &certs {
@@ -376,11 +402,13 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
             Err(e) => return (false, format!("Не удалось запустить update-ca-trust: {}", e)),
         }
     } else {
-        let _ = tx.send(LogEvent::Line("⚠ update-ca-trust не найден — пропускаю системное хранилище".to_string()));
+        let _ = tx.send(LogEvent::Line("⚠ update-ca-trust не найден — пропускаю".to_string()));
     }
 
+    // === 2. NSS-база Chromium ===
     let (home, real_user) = real_home_and_user();
-    let nssdb = format!("sql:{}/.pki/nssdb", home);
+    let nssdb_path = format!("{}/.pki/nssdb", home);
+    let nssdb = format!("sql:{}", nssdb_path);
 
     if !command_exists("certutil") {
         let _ = tx.send(LogEvent::Line("certutil нет — ставлю nss-tools...".to_string()));
@@ -394,32 +422,64 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
             }
         }
         if !ok {
-            let _ = tx.send(LogEvent::Line("⚠ Не удалось установить nss-tools — пропускаю NSS".to_string()));
+            let _ = tx.send(LogEvent::Line("⚠ Не удалось установить nss-tools — NSS пропущен".to_string()));
             return (true, "Сертификат в системное хранилище (NSS пропущен)".to_string());
         }
     }
 
-    let _ = fs::create_dir_all(format!("{}/.pki/nssdb", home));
-    let mut init = Command::new("certutil");
-    init.arg("-d").arg(&nssdb).arg("-N").arg("--empty-password");
-    let _ = init.status();
+    let _ = fs::create_dir_all(&nssdb_path);
 
+    // Инициализация базы ТОЛЬКО если её ещё нет (иначе certutil запросит пароль)
+    let db_exists = Path::new(&format!("{}/cert9.db", nssdb_path)).exists()
+                 || Path::new(&format!("{}/cert8.db", nssdb_path)).exists();
+    if !db_exists {
+        let _ = tx.send(LogEvent::Line("Создаю новую NSS-базу...".to_string()));
+        let mut init = Command::new("certutil");
+        init.arg("-d").arg(&nssdb).arg("-N").arg("--empty-password");
+        let _ = init.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    } else {
+        let _ = tx.send(LogEvent::Line("NSS-база уже существует — пропускаю инициализацию".to_string()));
+    }
+
+    // Добавление сертификатов. Ключевой фикс: передаём пустой пароль через stdin,
+    // чтобы certutil не запрашивал его интерактивно (и не зацикливался).
     for cert in &certs {
         let nick = Path::new(cert).file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let mut del = Command::new("certutil");
-        del.arg("-d").arg(&nssdb).arg("-D").arg("-n").arg(&nick);
-        let _ = del.status();
-        let mut add = Command::new("certutil");
-        add.arg("-d").arg(&nssdb).arg("-A").arg("-t").arg("C,,").arg("-n").arg(&nick).arg("-i").arg(cert);
-        match run_process(add, tx) {
-            Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {}", nick))); }
-            _ => { let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS не добавлен: {}", nick))); }
+
+        // Сначала удаляем старый с тем же nick (игнорируем ошибку)
+        let del_cmd = format!(
+            "echo '' | certutil -d '{}' -D -n '{}' 2>/dev/null",
+            nssdb, nick
+        );
+        let _ = Command::new("sh").arg("-c").arg(&del_cmd)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+
+        // Добавляем новый — пустой пароль через stdin
+        let add_cmd = format!(
+            "echo '' | certutil -d '{}' -A -t 'C,,' -n '{}' -i '{}'",
+            nssdb, nick, cert
+        );
+        let _ = tx.send(LogEvent::Line(format!("Добавляю в NSS: {}...", nick)));
+        match Command::new("sh").arg("-c").arg(&add_cmd)
+            .stdout(Stdio::piped()).stderr(Stdio::piped())
+            .status()
+        {
+            Ok(s) if s.success() => {
+                let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {}", nick)));
+            }
+            Ok(s) => {
+                let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS не добавлен (код {:?}): {}", s.code(), nick)));
+            }
+            Err(e) => {
+                let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS ошибка: {}", e)));
+            }
         }
     }
 
+    // Вернуть права реальному юзеру
     if let Some(user) = real_user {
         let mut ch = Command::new("chown");
-        ch.arg("-R").arg(format!("{}:{}", user, user)).arg(format!("{}/.pki", home));
+        ch.arg("-R").arg(format!("{}:{}", user, user)).arg(&nssdb_path);
         let _ = ch.status();
         let _ = tx.send(LogEvent::Line(format!("   ✅ chown .pki → {}", user)));
     }
