@@ -707,12 +707,52 @@ fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, t
                 Err(e) => return (false, format!("Не удалось скачать {}: {}", pkg_name, e)),
             }
         } else {
+            // Alt Linux: пробуем apt-get download (скачивает в текущую папку)
+            let _ = tx.send(LogEvent::Line(format!("Пробую apt-get download {}...", pkg_name)));
             let mut cmd = Command::new(pm);
-            cmd.arg("install").arg("--download-only").arg("-y")
-                .arg(format!("-o Dir::Cache::Archives={}", folder))
+            cmd.current_dir(folder)
+                .arg("download")
                 .arg(pkg_name);
+
             match run_process(cmd, tx) {
-                Ok(s) if s.success() => return (true, format!("{} скачан", pkg_name)),
+                Ok(s) if s.success() => {
+                    // Проверяем, что файлы скачались
+                    let files = find_local_packages(folder, pkg_name, os_type);
+                    if !files.is_empty() {
+                        let _ = tx.send(LogEvent::Line(format!("[OK] {} скачан через apt-get download", pkg_name)));
+                        return (true, format!("{} скачан", pkg_name));
+                    }
+                    let _ = tx.send(LogEvent::Line("apt-get download не скачал файлы, пробую fallback...".to_string()));
+                }
+                _ => {
+                    let _ = tx.send(LogEvent::Line("apt-get download не сработал, пробую fallback...".to_string()));
+                }
+            }
+
+            // Fallback: apt-get install --download-only (скачивает в /var/cache/apt/archives/)
+            let cache_dir = "/var/cache/apt/archives";
+            let _ = tx.send(LogEvent::Line(format!("Пробую apt-get install --download-only {}...", pkg_name)));
+
+            let mut cmd = Command::new(pm);
+            cmd.arg("install")
+                .arg("--download-only")
+                .arg(pkg_name);
+
+            match run_process(cmd, tx) {
+                Ok(s) if s.success() => {
+                    let _ = tx.send(LogEvent::Line("Копирую из кэша...".to_string()));
+                    // Копируем все .rpm и .deb из кэша в нашу папку
+                    let copy_cmd = format!("find {} -name '*.rpm' -o -name '*.deb' | xargs -I {{}} cp {{}} {} 2>/dev/null", cache_dir, folder);
+                    let _ = Command::new("sh").arg("-c").arg(&copy_cmd).status();
+
+                    // Проверяем результат
+                    let files = find_local_packages(folder, pkg_name, os_type);
+                    if !files.is_empty() {
+                        return (true, format!("{} скачан через кэш", pkg_name));
+                    } else {
+                        return (false, format!("{} не скачан: файлы не найдены в кэше", pkg_name));
+                    }
+                }
                 Ok(s) => {
                     let _ = tx.send(LogEvent::Line(format!("[!] {} не найден, пробую следующее имя...", pkg_name)));
                     continue;
