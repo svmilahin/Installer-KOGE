@@ -242,7 +242,6 @@ fn is_package_for_arch(filename: &str, system_arch: &str) -> bool {
 
 // ==================== МАППИНГ ПАКЕТОВ ДЛЯ РАЗНЫХ ОС ====================
 
-/// Возвращает список возможных имён пакета для конкретной ОС
 fn get_package_name_for_os(package_name: &str, os_type: &str) -> Vec<String> {
     match (package_name, os_type) {
         ("newt", "alt") => vec!["libnewt".to_string()],
@@ -256,7 +255,6 @@ fn get_package_name_for_os(package_name: &str, os_type: &str) -> Vec<String> {
     }
 }
 
-/// Проверяет, установлен ли пакет
 fn is_package_installed(package_name: &str, os_type: &str) -> bool {
     if os_type == "alt" {
         let check_cmd = format!("dpkg -s {} 2>/dev/null | grep -q 'Status: install ok installed' || rpm -q {} >/dev/null 2>&1", package_name, package_name);
@@ -281,7 +279,7 @@ fn is_package_installed(package_name: &str, os_type: &str) -> bool {
     }
 }
 
-// ==================== ШАГ 1: НАСТРОЙКА ПРОКСИ (с проверкой) ====================
+// ==================== ШАГ 1: НАСТРОЙКА ПРОКСИ ====================
 
 fn setup_proxy(os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let proxy_url = get_proxy_url();
@@ -367,7 +365,7 @@ fn setup_proxy(os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     (true, "Прокси настроен".to_string())
 }
 
-// ==================== ШАГ 2: УСТАНОВКА СЕРТИФИКАТА (с проверкой) ====================
+// ==================== ШАГ 2: УСТАНОВКА СЕРТИФИКАТА ====================
 
 fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = tx.send(LogEvent::Line(format!("=== Проверка сертификатов из '{}' ===", cert_dir)));
@@ -462,10 +460,10 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
 
     if command_exists("update-ca-trust") {
         let _ = tx.send(LogEvent::Line("Запускаю update-ca-trust...".to_string()));
-        let mut cmd = Command::new("update-ca-trust");
+        let cmd = Command::new("update-ca-trust");
         match run_process(cmd, tx) {
             Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line("[OK] Системное хранилище обновлено".to_string())); }
-            Ok(s) => return (false, format!("update-ca-trust завершился с ошибкой. Код: {:?}", s.code())),
+            Ok(_s) => return (false, "update-ca-trust завершился с ошибкой".to_string()),
             Err(e) => return (false, format!("Не удалось запустить update-ca-trust: {}", e)),
         }
     } else {
@@ -535,8 +533,8 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
             Ok(s) if s.success() => {
                 let _ = tx.send(LogEvent::Line(format!("   [OK] NSS: {}", nick)));
             }
-            Ok(s) => {
-                let _ = tx.send(LogEvent::Line(format!("   [!] NSS не добавлен (код {:?}): {}", s.code(), nick)));
+            Ok(_s) => {
+                let _ = tx.send(LogEvent::Line(format!("   [!] NSS не добавлен: {}", nick)));
             }
             Err(e) => {
                 let _ = tx.send(LogEvent::Line(format!("   [!] NSS ошибка: {}", e)));
@@ -574,7 +572,7 @@ fn download_updates(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEven
         cmd.arg("upgrade").arg("--downloadonly").arg(format!("--destdir={}", download_dir)).arg("-y");
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, "Обновления скачаны".to_string()),
-            Ok(s) => (false, format!("Ошибка скачивания. Код: {:?}", s.code())),
+            Ok(_s) => (false, "Ошибка скачивания".to_string()),
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
@@ -609,7 +607,7 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
         for pkg in packages { cmd.arg(pkg); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, "Пакеты скачаны".to_string()),
-            Ok(s) => (false, format!("Ошибка. Код: {:?}", s.code())),
+            Ok(_s) => (false, "Ошибка скачивания".to_string()),
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
@@ -619,15 +617,13 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
         let mut skipped = 0;
         let mut failed = 0;
 
-        // Очищаем кэш перед скачиванием, чтобы потом скопировать только новые файлы
-        let _ = Command::new("rm").arg("-rf").arg(format!("{}/school-installer-tmp", cache_dir)).status();
         let tmp_cache = format!("{}/school-installer-tmp", cache_dir);
+        let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
         let _ = fs::create_dir_all(&tmp_cache);
 
         for pkg in packages {
             let _ = tx.send(LogEvent::Line(format!("Пробую скачать {}...", pkg)));
 
-            // Скачиваем во временный кэш
             let mut cmd = Command::new(pm);
             cmd.arg("install")
                 .arg("--download-only")
@@ -637,17 +633,14 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
 
             match run_process(cmd, tx) {
                 Ok(s) if s.success() => {
-                    // Копируем все .rpm из временного кэша в целевую папку
                     let copy_cmd = format!("find {} -name '*.rpm' -exec cp {{}} {}/ \\; 2>/dev/null", tmp_cache, download_dir);
                     let _ = Command::new("sh").arg("-c").arg(&copy_cmd).status();
 
-                    // Проверяем, что что-то скопировалось
                     let files = find_local_packages(download_dir, pkg, os_type);
                     if !files.is_empty() {
                         downloaded += 1;
                         let _ = tx.send(LogEvent::Line(format!("[OK] {} скачан ({} файлов)", pkg, files.len())));
                     } else {
-                        // Возможно пакет уже установлен — проверяем
                         if is_package_installed(pkg, os_type) {
                             skipped += 1;
                             let _ = tx.send(LogEvent::Line(format!("[!] {} уже установлен — пропущен", pkg)));
@@ -656,13 +649,10 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
                             let _ = tx.send(LogEvent::Line(format!("[!] {} не найден в репозитории Alt Linux — пропущен", pkg)));
                         }
                     }
-
-                    // Очищаем временный кэш
                     let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
                     let _ = fs::create_dir_all(&tmp_cache);
                 }
-                Ok(s) => {
-                    // Пакет не найден — не фатальная ошибка
+                Ok(_s) => {
                     skipped += 1;
                     let _ = tx.send(LogEvent::Line(format!("[!] {} не найден в репозитории Alt Linux — пропущен", pkg)));
                     let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
@@ -675,7 +665,6 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
             }
         }
 
-        // Финальная очистка
         let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
 
         let mut msg = format!("Скачано: {}, пропущено: {}", downloaded, skipped);
@@ -691,31 +680,10 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
     }
 }
 
-fn find_local_packages(folder: &str, pattern: &str, os_type: &str) -> Vec<String> {
-    let system_arch = detect_arch();
-    let extension = "rpm";
-    let mut found = Vec::new();
-    if let Ok(entries) = fs::read_dir(folder) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) {
-                Some(n) => n,
-                None => continue,
-            };
-            if !name.ends_with(extension) { continue; }
-            if !name.starts_with(pattern) { continue; }
-            if !is_package_for_arch(&name, &system_arch) { continue; }
-            found.push(path.to_string_lossy().to_string());
-        }
-    }
-    found
-}
-
 // ==================== УСТАНОВКА ИЗ ПАПКИ ====================
 
 fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
-    // Alt Linux И ROSA используют RPM!
     let extension = "rpm";
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
 
@@ -737,17 +705,16 @@ fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogE
         for file in &files { cmd.arg(file); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, format!("Установлено пакетов: {}", files.len())),
-            Ok(s) => (false, format!("Ошибка установки. Код: {:?}", s.code())),
+            Ok(_s) => (false, "Ошибка установки".to_string()),
             Err(e) => (false, format!("Не удалось запустить установку: {}", e)),
         }
     } else {
-        // Alt Linux: apt-get install -f понимает .rpm
         let mut cmd = Command::new(pm);
         cmd.arg("install").arg("-f").arg("-y");
         for file in &files { cmd.arg(file); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, format!("Установлено пакетов: {}", files.len())),
-            Ok(s) => (false, format!("Ошибка установки. Код: {:?}", s.code())),
+            Ok(_s) => (false, "Ошибка установки".to_string()),
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     }
@@ -755,14 +722,17 @@ fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogE
 
 // ==================== КРИПТОПРО + ГИА ====================
 
-fn find_local_packages(folder: &str, pattern: &str, os_type: &str) -> Vec<String> {
+fn find_local_packages(folder: &str, pattern: &str, _os_type: &str) -> Vec<String> {
     let system_arch = detect_arch();
     let extension = "rpm";
     let mut found = Vec::new();
     if let Ok(entries) = fs::read_dir(folder) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) { Some(n) => n, None => continue };
+            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) {
+                Some(n) => n,
+                None => continue,
+            };
             if !name.ends_with(extension) { continue; }
             if !name.starts_with(pattern) { continue; }
             if !is_package_for_arch(&name, &system_arch) { continue; }
@@ -788,23 +758,19 @@ fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, t
                 .arg(pkg_name);
             match run_process(cmd, tx) {
                 Ok(s) if s.success() => return (true, format!("{} скачан", pkg_name)),
-                Ok(s) => {
+                Ok(_s) => {
                     let _ = tx.send(LogEvent::Line(format!("[!] {} не найден, пробую следующее имя...", pkg_name)));
                     continue;
                 }
                 Err(e) => return (false, format!("Не удалось скачать {}: {}", pkg_name, e)),
             }
         } else {
-            // Alt Linux: пробуем apt-get download (скачивает в текущую папку)
             let _ = tx.send(LogEvent::Line(format!("Пробую apt-get download {}...", pkg_name)));
             let mut cmd = Command::new(pm);
-            cmd.current_dir(folder)
-                .arg("download")
-                .arg(pkg_name);
-
+            cmd.current_dir(folder).arg("download").arg(pkg_name);
+            
             match run_process(cmd, tx) {
                 Ok(s) if s.success() => {
-                    // Проверяем, что файлы скачались
                     let files = find_local_packages(folder, pkg_name, os_type);
                     if !files.is_empty() {
                         let _ = tx.send(LogEvent::Line(format!("[OK] {} скачан через apt-get download", pkg_name)));
@@ -816,24 +782,19 @@ fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, t
                     let _ = tx.send(LogEvent::Line("apt-get download не сработал, пробую fallback...".to_string()));
                 }
             }
-
-            // Fallback: apt-get install --download-only (скачивает в /var/cache/apt/archives/)
+            
             let cache_dir = "/var/cache/apt/archives";
             let _ = tx.send(LogEvent::Line(format!("Пробую apt-get install --download-only {}...", pkg_name)));
-
+            
             let mut cmd = Command::new(pm);
-            cmd.arg("install")
-                .arg("--download-only")
-                .arg(pkg_name);
-
+            cmd.arg("install").arg("--download-only").arg(pkg_name);
+            
             match run_process(cmd, tx) {
                 Ok(s) if s.success() => {
                     let _ = tx.send(LogEvent::Line("Копирую из кэша...".to_string()));
-                    // Копируем все .rpm и .deb из кэша в нашу папку
                     let copy_cmd = format!("find {} -name '*.rpm' -o -name '*.deb' | xargs -I {{}} cp {{}} {} 2>/dev/null", cache_dir, folder);
                     let _ = Command::new("sh").arg("-c").arg(&copy_cmd).status();
-
-                    // Проверяем результат
+                    
                     let files = find_local_packages(folder, pkg_name, os_type);
                     if !files.is_empty() {
                         return (true, format!("{} скачан через кэш", pkg_name));
@@ -841,7 +802,7 @@ fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, t
                         return (false, format!("{} не скачан: файлы не найдены в кэше", pkg_name));
                     }
                 }
-                Ok(s) => {
+                Ok(_s) => {
                     let _ = tx.send(LogEvent::Line(format!("[!] {} не найден, пробую следующее имя...", pkg_name)));
                     continue;
                 }
@@ -865,7 +826,7 @@ fn install_local_packages(folder: &str, pattern: &str, os_type: &str, tx: &mpsc:
         for file in &files { cmd.arg(file); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, format!("{} установлены", pattern)),
-            Ok(s) => (false, format!("Ошибка установки {}. Код: {:?}", pattern, s.code())),
+            Ok(_s) => (false, format!("Ошибка установки {}", pattern)),
             Err(e) => (false, format!("Не удалось установить {}: {}", pattern, e)),
         }
     } else {
@@ -874,13 +835,13 @@ fn install_local_packages(folder: &str, pattern: &str, os_type: &str, tx: &mpsc:
         for file in &files { cmd.arg(file); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => (true, format!("{} установлены", pattern)),
-            Ok(s) => (false, format!("Ошибка установки {}. Код: {:?}", pattern, s.code())),
+            Ok(_s) => (false, format!("Ошибка установки {}", pattern)),
             Err(e) => (false, format!("Не удалось установить {}: {}", pattern, e)),
         }
     }
 }
 
-fn install_cryptopro_csp(crypto_subdir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn install_cryptopro_csp(crypto_subdir: &str, _os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let install_script = Path::new(crypto_subdir).join("install.sh");
     let uninstall_script = Path::new(crypto_subdir).join("uninstall.sh");
     if !install_script.exists() { return (false, "В linux-amd64/ не найден install.sh КриптоПро".to_string()); }
@@ -890,7 +851,7 @@ fn install_cryptopro_csp(crypto_subdir: &str, os_type: &str, tx: &mpsc::Sender<L
     cmd.current_dir(crypto_subdir).arg("./install.sh").arg("kc1").arg("--yes");
     match run_process(cmd, tx) {
         Ok(s) if s.success() => (true, "КриптоПро CSP установлен".to_string()),
-        Ok(s) => (false, format!("install.sh завершился с ошибкой. Код: {:?}", s.code())),
+        Ok(_s) => (false, "install.sh завершился с ошибкой".to_string()),
         Err(e) => (false, format!("Не удалось запустить install.sh: {}", e)),
     }
 }
@@ -899,7 +860,6 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: 
     let _ = fs::create_dir_all(crypto_dir);
     let _ = fs::create_dir_all(school_dir);
 
-    // --- ШАГ 1: newt (с проверкой установки) ---
     let _ = tx.send(LogEvent::Line("=== ШАГ 1/5: newt ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.0, "Шаг 1: newt...".to_string()));
 
@@ -919,7 +879,6 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: 
         if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
     }
 
-    // --- ШАГ 2.1: pcsc-lite (с проверкой установки) ---
     let _ = tx.send(LogEvent::Line("=== ШАГ 2.1/5: pcsc-lite + pcsc-lite-ccid ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.15, "Шаг 2.1: pcsc-lite...".to_string()));
 
@@ -941,7 +900,6 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: 
         }
     }
 
-    // --- ШАГ 2.2: librtpkcs11ecp ---
     let _ = tx.send(LogEvent::Line("=== ШАГ 2.2/5: librtpkcs11ecp ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.3, "Шаг 2.2: librtpkcs11ecp...".to_string()));
 
@@ -960,14 +918,12 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: 
         if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
     }
 
-    // --- ШАГ 3: КриптоПро CSP ---
     let _ = tx.send(LogEvent::Line("=== ШАГ 3/5: КриптоПро CSP ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.5, "Шаг 3: КриптоПро...".to_string()));
     let crypto_subdir = Path::new(crypto_dir).join("linux-amd64");
     let (ok, msg) = install_cryptopro_csp(&crypto_subdir.to_string_lossy(), os_type, tx);
     if !ok { return (false, format!("Шаг 3 (КриптоПро): {}", msg)); }
 
-    // --- ШАГ 4: GIA11_PPE ---
     let _ = tx.send(LogEvent::Line("=== ШАГ 4/5: GIA11_PPE ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.75, "Шаг 4: GIA11_PPE...".to_string()));
     if find_local_packages(crypto_dir, "GIA11_PPE", os_type).is_empty() {
@@ -976,7 +932,6 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: 
     let (ok, msg) = install_local_packages(crypto_dir, "GIA11_PPE", os_type, tx);
     if !ok { return (false, format!("Шаг 4 (GIA11_PPE): {}", msg)); }
 
-    // --- ШАГ 5: Запуск pcscd ---
     let _ = tx.send(LogEvent::Line("=== ШАГ 5/5: Запуск pcscd ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.9, "Шаг 5: запуск pcscd...".to_string()));
     let mut cmd = Command::new("systemctl");
@@ -1235,7 +1190,6 @@ fn ui(f: &mut Frame, app: &App) {
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    // CLI-режим для управления настройками
     if args.len() >= 2 {
         let mode = args[1].trim_start_matches("--");
         match mode {
@@ -1308,7 +1262,6 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // CLI-режим для рабочих команд
     if args.len() > 1 {
         let mode = args[1].trim_start_matches("--");
         let os_type = detect_os();
@@ -1339,7 +1292,6 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // TUI-режим
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
