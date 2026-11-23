@@ -990,6 +990,86 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: 
         let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, os_type, tx);
         if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
     } else if lib_installed {
+        // 👇 ИСПРАВЛЕНО: добавлена закрывающая скобка в конце
+        let _ = tx.send(LogEvent::Line("[OK] librtpkcs11ecp уже установлен".to_string()));
+    }
+    if !lib_installed {
+        let (ok, msg) = install_local_packages(crypto_dir, "librtpkcs11ecp", os_type, tx);
+        if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
+    }
+
+    let _ = tx.send(LogEvent::Line("=== ШАГ 3/5: КриптоПро CSP ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.5, "Шаг 3: КриптоПро...".to_string()));
+    let crypto_subdir = Path::new(crypto_dir).join("linux-amd64");
+    let (ok, msg) = install_cryptopro_csp(&crypto_subdir.to_string_lossy(), os_type, tx);
+    if !ok { return (false, format!("Шаг 3 (КриптоПро): {}", msg)); }
+
+    let _ = tx.send(LogEvent::Line("=== ШАГ 4/5: GIA11_PPE ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.75, "Шаг 4: GIA11_PPE...".to_string()));
+    if find_packages_flat(crypto_dir, "GIA11_PPE", &system_arch, os_type).is_empty() {
+        return (false, "GIA11_PPE*.rpm не найден в cryptopro_gia/. Положите файл и повторите.".to_string());
+    }
+    let (ok, msg) = install_local_packages(crypto_dir, "GIA11_PPE", os_type, tx);
+    if !ok { return (false, format!("Шаг 4 (GIA11_PPE): {}", msg)); }
+
+    let _ = tx.send(LogEvent::Line("=== ШАГ 5/5: Запуск pcscd ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.9, "Шаг 5: запуск pcscd...".to_string()));
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("enable").arg("--now").arg("pcscd");
+    match run_process(cmd, tx) {
+        Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line("[OK] pcscd запущен".to_string())); }
+        _ => { let _ = tx.send(LogEvent::Line("[!] pcscd не запущен — вручную: systemctl enable --now pcscd".to_string())); }
+    }
+
+    (true, "Установлено: newt, pcsc-lite, librtpkcs11ecp, КриптоПро CSP, GIA11_PPE".to_string())
+}
+
+
+fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let _ = fs::create_dir_all(crypto_dir);
+    let _ = fs::create_dir_all(school_dir);
+    let system_arch = detect_arch();
+
+    let _ = tx.send(LogEvent::Line("=== ШАГ 1/5: newt ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.0, "Шаг 1: newt...".to_string()));
+    let newt_names = get_package_name_for_os("newt", os_type);
+    let newt_installed = newt_names.iter().any(|name| is_package_installed(name, os_type));
+    if !newt_installed && find_packages_flat(crypto_dir, "newt", &system_arch, os_type).is_empty() {
+        let _ = tx.send(LogEvent::Line("newt не установлен — скачиваю...".to_string()));
+        let (ok, msg) = download_package_to_folder("newt", crypto_dir, os_type, tx);
+        if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
+    } else if newt_installed {
+        let _ = tx.send(LogEvent::Line("[OK] newt уже установлен".to_string()));
+    }
+    if !newt_installed {
+        let (ok, msg) = install_local_packages(crypto_dir, "newt", os_type, tx);
+        if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
+    }
+
+    let _ = tx.send(LogEvent::Line("=== ШАГ 2.1/5: pcsc-lite + pcsc-lite-ccid ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.15, "Шаг 2.1: pcsc-lite...".to_string()));
+    for pkg in &["pcsc-lite", "pcsc-lite-ccid"] {
+        let pkg_names = get_package_name_for_os(pkg, os_type);
+        let pkg_installed = pkg_names.iter().any(|name| is_package_installed(name, os_type));
+        if !pkg_installed && find_packages_flat(crypto_dir, pkg, &system_arch, os_type).is_empty() {
+            let (ok, msg) = download_package_to_folder(pkg, crypto_dir, os_type, tx);
+            if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
+        } else if pkg_installed {
+            let _ = tx.send(LogEvent::Line(format!("[OK] {} уже установлен", pkg)));
+        }
+        if !pkg_installed {
+            let (ok, msg) = install_local_packages(crypto_dir, pkg, os_type, tx);
+            if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
+        }
+    }
+
+    let _ = tx.send(LogEvent::Line("=== ШАГ 2.2/5: librtpkcs11ecp ===".to_string()));
+    let _ = tx.send(LogEvent::Progress(0.3, "Шаг 2.2: librtpkcs11ecp...".to_string()));
+    let lib_installed = is_package_installed("librtpkcs11ecp", os_type);
+    if !lib_installed && find_packages_flat(crypto_dir, "librtpkcs11ecp", &system_arch, os_type).is_empty() {
+        let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, os_type, tx);
+        if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
+    } else if lib_installed {
         let _ = tx.send(LogEvent::Line("[OK] librtpkcs11ecp уже установлен".to_string());
     }
     if !lib_installed {
@@ -1407,6 +1487,3 @@ fn main() -> io::Result<()> {
     terminal.show_cursor()?;
     Ok(())
 }
-
-
-
