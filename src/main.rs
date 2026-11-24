@@ -787,28 +787,25 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
-        let cache_dir = "/var/cache/apt/archives";
-        let tmp_cache = format!("{}/school-installer-tmp", cache_dir);
-        let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
-        let _ = fs::create_dir_all(&tmp_cache);
+        // Alt Linux: используем apt-get download — скачивает .rpm ПРЯМО в текущую папку
         let mut downloaded = 0;
         let mut skipped = 0;
         for pkg in packages {
             let _ = tx.send(LogEvent::Line(format!("Пробую скачать {}...", pkg)));
+
             let mut cmd = Command::new(pm);
-            cmd.arg("install").arg("--download-only").arg("-y")
-                .arg(format!("-o Dir::Cache::Archives={}", tmp_cache)).arg(pkg);
+            cmd.current_dir(download_dir).arg("download").arg(pkg);
+
             match run_process(cmd, tx) {
                 Ok(s) if s.success() => {
-                    let copy_cmd = format!("find {} -name '*.rpm' -exec cp {{}} {}/ \\; 2>/dev/null", tmp_cache, download_dir);
-                    let _ = Command::new("sh").arg("-c").arg(&copy_cmd).status();
+                    // Проверяем, что файл реально появился
                     let files = find_packages_flat(download_dir, pkg, &detect_arch(), os_type);
                     if !files.is_empty() {
                         downloaded += 1;
-                        let _ = tx.send(LogEvent::Line(format!("[OK] {} скачан", pkg)));
+                        let _ = tx.send(LogEvent::Line(format!("[OK] {} скачан ({} файлов)", pkg, files.len())));
                     } else {
                         skipped += 1;
-                        let _ = tx.send(LogEvent::Line(format!("[!] {} уже установлен или не скачан", pkg)));
+                        let _ = tx.send(LogEvent::Line(format!("[!] {} скачан, но не найден по шаблону", pkg)));
                     }
                 }
                 Ok(_s) => {
@@ -820,10 +817,7 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
                     let _ = tx.send(LogEvent::Line(format!("[!] Ошибка {}: {}", pkg, e)));
                 }
             }
-            let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
-            let _ = fs::create_dir_all(&tmp_cache);
         }
-        let _ = Command::new("rm").arg("-rf").arg(&tmp_cache).status();
         let local = find_packages_flat(download_dir, "", &detect_arch(), os_type);
         let msg = format!("Скачано: {}, пропущено: {}, локальных: {}", downloaded, skipped, local.len());
         if downloaded > 0 || !local.is_empty() { (true, msg) } else { (false, msg) }
