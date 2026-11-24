@@ -47,7 +47,7 @@ fn load_settings() -> HashMap<String, String> {
 fn save_setting(key: &str, value: &str) -> io::Result<()> {
     let mut settings = load_settings();
     settings.insert(key.to_string(), value.to_string());
-    let mut content = String::from("# Настройки школьного установщика\n");
+    let mut content = String::from("# Настройки школьного установщика (МОС ОС)\n");
     content += &format!("PROXY_URL={}\n", settings.get("PROXY_URL").map(|s| s.as_str()).unwrap_or(DEFAULT_PROXY_URL));
     content += &format!("CERT_DIR={}\n", settings.get("CERT_DIR").map(|s| s.as_str()).unwrap_or(DEFAULT_CERT_DIR));
     content += &format!("CRYPTO_DIR={}\n", settings.get("CRYPTO_DIR").map(|s| s.as_str()).unwrap_or(DEFAULT_CRYPTO_DIR));
@@ -188,19 +188,6 @@ fn command_exists(name: &str) -> bool {
 
 // ==================== ОПРЕДЕЛЕНИЕ СИСТЕМЫ ====================
 
-fn detect_os() -> String {
-    if let Ok(content) = fs::read_to_string("/etc/os-release") {
-        let lower = content.to_lowercase();
-        if lower.contains("rosa") || lower.contains("mosos") || lower.contains("mos") {
-            return "rosa".to_string();
-        }
-        if lower.contains("alt") {
-            return "alt".to_string();
-        }
-    }
-    "unknown".to_string()
-}
-
 fn detect_arch() -> String {
     Command::new("uname")
         .arg("-m")
@@ -254,43 +241,20 @@ fn is_package_for_arch(filename: &str, system_arch: &str) -> bool {
     true
 }
 
-fn is_package_for_os(filename: &str, os_type: &str) -> bool {
-    let lower = filename.to_lowercase();
-    let rosa_markers = ["rosa", "mos", "mosos", "p10", "p9", "p8"];
-    let alt_markers = ["altlinux", "altlinux64", "altlinux32"];
-
-    match os_type {
-        "rosa" => {
-            for marker in &alt_markers {
-                if lower.contains(marker) { return false; }
-            }
-            true
-        }
-        "alt" => {
-            for marker in &rosa_markers {
-                if lower.contains(marker) { return false; }
-            }
-            true
-        }
-        _ => true,
-    }
-}
-
 // ==================== АВТОСОЗДАНИЕ ПАПОК И ИНСТРУКЦИЙ ====================
 
-fn ensure_directories(os_type: &str) {
+fn ensure_directories() {
     let base_packages = get_school_packages_dir();
     let base_updates = get_updates_dir();
     let crypto_dir = get_crypto_dir();
     let cert_dir = get_cert_dir();
 
-    // ВАЖНО: тип кортежа (String, &str), т.к. пути — это String
     let dirs_with_readme: Vec<(String, &str)> = vec![
         (
-            format!("{}/rosa", base_packages),
+            base_packages.clone(),
             "ПАКЕТЫ ДЛЯ МОС ОС (ROSA)\n\
              ========================================\n\
-             Сюда кладите .rpm пакеты для МОС ОС / РОСА.\n\
+             Сюда автоматически скачиваются пакеты для установки.\n\
              \n\
              Основные пакеты:\n\
              - task-koge-*.rpm        (метапакет для ОГЭ/ЕГЭ по информатике)\n\
@@ -301,45 +265,11 @@ fn ensure_directories(os_type: &str) {
              1. Запустите на машине с МОС ОС и интернетом:\n\
                 sudo ./school-installer --download-packages\n\
              2. Пакеты автоматически скачаются в эту папку\n\
-             3. Скопируйте папку school_packages/rosa/ на флешку"
+             3. Скопируйте папку school_packages/ на флешку"
         ),
         (
-            format!("{}/alt", base_packages),
-            "ПАКЕТЫ ДЛЯ ALT LINUX EDUCATION\n\
-             ========================================\n\
-             Сюда кладите .rpm пакеты для Alt Linux Education.\n\
-             \n\
-             Рекомендуемые пакеты (точные имена из репозитория p10/p11):\n\
-             - kumir2-*.rpm           (КуМир — школьный алгоритмический язык)\n\
-             - python3-modules-tkinter-*.rpm (Tkinter для Python 3)\n\
-             - fpc-*.rpm              (Free Pascal Compiler)\n\
-             - lazarus-*.rpm          (Lazarus IDE)\n\
-             - geany-*.rpm            (лёгкий редактор кода)\n\
-             - libreoffice-*.rpm      (офисный пакет)\n\
-             - chromium-*.rpm         (браузер)\n\
-             - gimp-*.rpm             (графический редактор)\n\
-             \n\
-             Как получить:\n\
-             1. На машине с Alt Linux и интернетом:\n\
-                sudo ./school-installer --download-packages\n\
-             2. Пакеты скачаются в эту папку\n\
-             3. Скопируйте school_packages/alt/ на флешку"
-        ),
-        (
-            format!("{}/rosa", base_updates),
+            base_updates.clone(),
             "ОБНОВЛЕНИЯ ДЛЯ МОС ОС (ROSA)\n\
-             ========================================\n\
-             Сюда автоматически скачиваются обновления системы.\n\
-             \n\
-             Как получить:\n\
-             sudo ./school-installer --download-updates\n\
-             \n\
-             Установка в классе:\n\
-             sudo ./school-installer --install-updates"
-        ),
-        (
-            format!("{}/alt", base_updates),
-            "ОБНОВЛЕНИЯ ДЛЯ ALT LINUX EDUCATION\n\
              ========================================\n\
              Сюда автоматически скачиваются обновления системы.\n\
              \n\
@@ -353,7 +283,7 @@ fn ensure_directories(os_type: &str) {
             format!("{}/linux-amd64", crypto_dir),
             "КРИПТОПРО CSP — ДИСТРИБУТИВ\n\
              ========================================\n\
-             ОДНА общая папка для МОС ОС и Alt Linux (оба используют RPM).\n\
+             Сюда положите дистрибутив КриптоПро CSP.\n\
              \n\
              Что сюда положить:\n\
              1. Распакуйте архив КриптоПро CSP (например, linux-amd64.tgz)\n\
@@ -366,10 +296,8 @@ fn ensure_directories(os_type: &str) {
                 - lsb-cprocsp-capilite-*.rpm\n\
                 - cprocsp-curl-*.rpm\n\
                 - lsb-cprocsp-ca-certs-*.rpm\n\
-                - cprocsp-compat-*.rpm    (для Alt: cprocsp-compat-altlinux64)\n\
              \n\
-             ВАЖНО: install.sh сам определит ОС (ROSA/Alt) и выберет\n\
-             правильный менеджер пакетов. Ничего менять не нужно!\n\
+             ВАЖНО: install.sh сам выберет правильный менеджер пакетов.\n\
              \n\
              Конфигурация: kc1 (по умолчанию) — для экзаменов.\n\
              kc2 используйте только если точно знаете, зачем."
@@ -380,11 +308,10 @@ fn ensure_directories(os_type: &str) {
              ========================================\n\
              Корень папки cryptopro_gia/ — сюда кладите:\n\
              \n\
-             1. newt-*.rpm (или libnewt-*.rpm для Alt)\n\
+             1. newt-*.rpm\n\
                 — нужен для install.sh КриптоПро\n\
              \n\
              2. pcsc-lite-*.rpm и pcsc-lite-ccid-*.rpm\n\
-                (для Alt: libpcsc-lite-*.rpm и libccid-*.rpm)\n\
                 — демон смарт-карт и драйвер USB-ридеров\n\
              \n\
              3. librtpkcs11ecp-*.rpm\n\
@@ -423,7 +350,7 @@ fn ensure_directories(os_type: &str) {
     }
 }
 
-fn print_setup_instructions(os_type: &str, tx: &mpsc::Sender<LogEvent>) {
+fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
     let base_packages = get_school_packages_dir();
     let base_updates = get_updates_dir();
     let crypto_dir = get_crypto_dir();
@@ -433,26 +360,23 @@ fn print_setup_instructions(os_type: &str, tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line("  ИНСТРУКЦИЯ ПО ПОДГОТОВКЕ ФЛЕШКИ".to_string()));
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
-    let _ = tx.send(LogEvent::Line(format!("Текущая ОС: {} | Архитектура: {}", os_type.to_uppercase(), detect_arch())));
+    let _ = tx.send(LogEvent::Line(format!("ОС: МОС ОС (ROSA) | Архитектура: {}", detect_arch())));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("1. school_packages/ — пакеты для установки".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   +-- rosa/   -- для МОС ОС ({})", Path::new(&format!("{}/rosa", base_packages)).exists())));
-    let _ = tx.send(LogEvent::Line(format!("   +-- alt/    -- для Alt Linux ({})", Path::new(&format!("{}/alt", base_packages)).exists())));
-    let _ = tx.send(LogEvent::Line("   В каждой папке — .rpm файлы для своей ОС".to_string()));
+    let _ = tx.send(LogEvent::Line(format!("   +-- task-koge, r7-office, notepadqq ({})", Path::new(&base_packages).exists())));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("2. updates/ — обновления системы".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   +-- rosa/   -- для МОС ОС ({})", Path::new(&format!("{}/rosa", base_updates)).exists())));
-    let _ = tx.send(LogEvent::Line(format!("   +-- alt/    -- для Alt Linux ({})", Path::new(&format!("{}/alt", base_updates)).exists())));
+    let _ = tx.send(LogEvent::Line(format!("   +-- обновления МОС ОС ({})", Path::new(&base_updates).exists())));
     let _ = tx.send(LogEvent::Line(String::new()));
 
-    let _ = tx.send(LogEvent::Line("3. cryptopro_gia/ — КриптоПро + ГИА (ОБЩАЯ для всех ОС)".to_string()));
+    let _ = tx.send(LogEvent::Line("3. cryptopro_gia/ — КриптоПро + ГИА".to_string()));
     let _ = tx.send(LogEvent::Line(format!("   +-- linux-amd64/  -- дистрибутив КриптоПро ({})", Path::new(&format!("{}/linux-amd64", crypto_dir)).exists())));
     let _ = tx.send(LogEvent::Line("   |   +-- install.sh        (ОБЯЗАТЕЛЬНО)".to_string()));
     let _ = tx.send(LogEvent::Line("   |   +-- uninstall.sh      (ОБЯЗАТЕЛЬНО)".to_string()));
     let _ = tx.send(LogEvent::Line("   |   \\-- *.rpm             (все из архива КриптоПро)".to_string()));
-    let _ = tx.send(LogEvent::Line("   +-- newt-*.rpm            (или libnewt для Alt)".to_string()));
+    let _ = tx.send(LogEvent::Line("   +-- newt-*.rpm            (нужен для install.sh)".to_string()));
     let _ = tx.send(LogEvent::Line("   +-- pcsc-lite-*.rpm       (демон смарт-карт)".to_string()));
     let _ = tx.send(LogEvent::Line("   +-- librtpkcs11ecp-*.rpm  (токены Рутокен/Jacarta)".to_string()));
     let _ = tx.send(LogEvent::Line("   \\-- GIA11_PPE-*.rpm       (платформа экзамена)".to_string()));
@@ -484,38 +408,18 @@ fn print_setup_instructions(os_type: &str, tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
 }
 
-// ==================== МАППИНГ ПАКЕТОВ ====================
+// ==================== ПРОВЕРКА УСТАНОВКИ ПАКЕТА ====================
 
-fn get_package_name_for_os(package_name: &str, os_type: &str) -> Vec<String> {
-    match (package_name, os_type) {
-        ("newt", "alt") => vec!["libnewt".to_string()],
-        ("newt", "rosa") => vec!["newt".to_string()],
-        ("pcsc-lite", "alt") => vec!["libpcsc-lite".to_string(), "pcsc-lite".to_string()],
-        ("pcsc-lite", "rosa") => vec!["pcsc-lite".to_string()],
-        ("pcsc-lite-ccid", "alt") => vec!["libccid".to_string(), "pcsc-lite-ccid".to_string()],
-        ("pcsc-lite-ccid", "rosa") => vec!["pcsc-lite-ccid".to_string()],
-        ("librtpkcs11ecp", _) => vec!["librtpkcs11ecp".to_string()],
-        _ => vec![package_name.to_string()],
-    }
-}
-
-fn is_package_installed(package_name: &str, os_type: &str) -> bool {
-    if os_type == "alt" {
-        let check_cmd = format!("dpkg -s {} 2>/dev/null | grep -q 'Status: install ok installed' || rpm -q {} >/dev/null 2>&1", package_name, package_name);
-        Command::new("sh").arg("-c").arg(&check_cmd)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status()
-            .map(|s| s.success()).unwrap_or(false)
-    } else {
-        let check_cmd = format!("rpm -q {} >/dev/null 2>&1", package_name);
-        Command::new("sh").arg("-c").arg(&check_cmd)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status()
-            .map(|s| s.success()).unwrap_or(false)
-    }
+fn is_package_installed(package_name: &str) -> bool {
+    let check_cmd = format!("rpm -q {} >/dev/null 2>&1", package_name);
+    Command::new("sh").arg("-c").arg(&check_cmd)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status()
+        .map(|s| s.success()).unwrap_or(false)
 }
 
 // ==================== ПОИСК ПАКЕТОВ ====================
 
-fn find_packages_flat(folder: &str, pattern: &str, system_arch: &str, os_type: &str) -> Vec<String> {
+fn find_packages_flat(folder: &str, pattern: &str, system_arch: &str) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
     if let Ok(entries) = fs::read_dir(folder) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -526,26 +430,20 @@ fn find_packages_flat(folder: &str, pattern: &str, system_arch: &str, os_type: &
             if !name.ends_with(".rpm") { continue; }
             if !pattern.is_empty() && !name.starts_with(pattern) { continue; }
             if !is_package_for_arch(&name, system_arch) { continue; }
-            if !is_package_for_os(&name, os_type) { continue; }
             result.push(path.to_string_lossy().to_string());
         }
     }
     result
 }
 
-fn get_os_subdir(base_dir: &str, os_type: &str) -> String {
-    Path::new(base_dir).join(os_type).to_string_lossy().to_string()
-}
-
 // ==================== ШАГ 1: ПРОКСИ ====================
 
-fn setup_proxy(os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let proxy_url = get_proxy_url();
     let profile_path = "/etc/profile.d/proxy.sh";
     let profile_ok = fs::read_to_string(profile_path).map(|c| c.contains(&proxy_url)).unwrap_or(false);
     let dnf_conf_ok = fs::read_to_string("/etc/dnf/dnf.conf").map(|c| c.contains(&format!("proxy={}", proxy_url))).unwrap_or(false);
-    let apt_conf_ok = fs::read_to_string("/etc/apt/apt.conf.d/95proxy").map(|c| c.contains(&proxy_url)).unwrap_or(false);
-    let already_configured = if os_type == "rosa" { profile_ok && dnf_conf_ok } else { profile_ok && apt_conf_ok };
+    let already_configured = profile_ok && dnf_conf_ok;
 
     if already_configured {
         let _ = tx.send(LogEvent::Line(format!("[OK] Прокси уже настроен ({})", proxy_url)));
@@ -563,49 +461,39 @@ fn setup_proxy(os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = Command::new("chmod").arg("644").arg(profile_path).status();
     let _ = tx.send(LogEvent::Line(format!("[+] {} создан", profile_path)));
 
-    if os_type == "rosa" {
-        let conf = "/etc/dnf/dnf.conf";
-        let content = fs::read_to_string(conf).unwrap_or_default();
-        let mut new_lines: Vec<String> = Vec::new();
-        let mut found = false;
-        let mut inserted_after_main = false;
-        for line in content.lines() {
-            if line.trim_start().starts_with("proxy=") {
+    let conf = "/etc/dnf/dnf.conf";
+    let content = fs::read_to_string(conf).unwrap_or_default();
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut found = false;
+    let mut inserted_after_main = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("proxy=") {
+            new_lines.push(format!("proxy={}", proxy_url));
+            found = true;
+        } else {
+            new_lines.push(line.to_string());
+            if !found && !inserted_after_main && line.trim() == "[main]" {
                 new_lines.push(format!("proxy={}", proxy_url));
+                inserted_after_main = true;
                 found = true;
-            } else {
-                new_lines.push(line.to_string());
-                if !found && !inserted_after_main && line.trim() == "[main]" {
-                    new_lines.push(format!("proxy={}", proxy_url));
-                    inserted_after_main = true;
-                    found = true;
-                }
             }
         }
-        if !found {
-            new_lines.insert(0, "[main]".to_string());
-            new_lines.insert(1, format!("proxy={}", proxy_url));
-        }
-        if let Err(e) = fs::write(conf, new_lines.join("\n") + "\n") {
-            return (false, format!("Не удалось записать {}: {}", conf, e));
-        }
-        let _ = tx.send(LogEvent::Line(format!("[+] {} обновлён", conf)));
-    } else {
-        let dir = "/etc/apt/apt.conf.d";
-        let _ = fs::create_dir_all(dir);
-        let path = format!("{}/95proxy", dir);
-        let content = format!("Acquire::http::Proxy \"{}\";\nAcquire::https::Proxy \"{}\";\n", proxy_url, proxy_url);
-        if let Err(e) = fs::write(&path, &content) {
-            return (false, format!("Не удалось записать {}: {}", path, e));
-        }
-        let _ = tx.send(LogEvent::Line(format!("[+] {} создан", path)));
     }
+    if !found {
+        new_lines.insert(0, "[main]".to_string());
+        new_lines.insert(1, format!("proxy={}", proxy_url));
+    }
+    if let Err(e) = fs::write(conf, new_lines.join("\n") + "\n") {
+        return (false, format!("Не удалось записать {}: {}", conf, e));
+    }
+    let _ = tx.send(LogEvent::Line(format!("[+] {} обновлён", conf)));
+
     (true, "Прокси настроен".to_string())
 }
 
 // ==================== ШАГ 2: СЕРТИФИКАТ ====================
 
-fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = tx.send(LogEvent::Line(format!("=== Проверка сертификатов из '{}' ===", cert_dir)));
     if !Path::new(cert_dir).exists() {
         let _ = tx.send(LogEvent::Line(format!("[!] Папка '{}' не найдена — пропускаем", cert_dir)));
@@ -679,10 +567,9 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
     let nssdb_path = format!("{}/.pki/nssdb", home);
     let nssdb = format!("sql:{}", nssdb_path);
     if !command_exists("certutil") {
-        let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
         let mut ok = false;
         for pkg in ["nss-tools", "libnss3-tools"] {
-            let mut cmd = Command::new(pm);
+            let mut cmd = Command::new("dnf");
             cmd.arg("install").arg("-y").arg(pkg);
             if let Ok(s) = run_process(cmd, tx) { if s.success() { ok = true; break; } }
         }
@@ -725,133 +612,62 @@ fn install_cert(cert_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (
     (true, format!("Сертификатов установлено: {}", certs.len()))
 }
 
-fn prepare_environment(os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
-    let (ok1, m1) = setup_proxy(os_type, tx);
+fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let (ok1, m1) = setup_proxy(tx);
     if !ok1 { return (false, format!("Прокси: {}", m1)); }
     let cert_dir = get_cert_dir();
-    let (ok2, m2) = install_cert(&cert_dir, os_type, tx);
+    let (ok2, m2) = install_cert(&cert_dir, tx);
     if !ok2 { return (false, format!("Сертификат: {}", m2)); }
     (true, format!("Прокси [OK] | {}", m2))
 }
 
 // ==================== СКАЧИВАНИЕ ====================
 
-fn download_updates(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
-    let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
-    if os_type == "rosa" {
-        let mut cmd = Command::new(pm);
-        cmd.arg("upgrade").arg("--downloadonly").arg(format!("--destdir={}", download_dir)).arg("-y");
-        match run_process(cmd, tx) {
-            Ok(s) if s.success() => (true, "Обновления скачаны".to_string()),
-            Ok(_s) => (false, "Ошибка скачивания".to_string()),
-            Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
-        }
-    } else {
-        let mut cmd1 = Command::new(pm); cmd1.arg("update"); let _ = run_process(cmd1, tx);
-        let sim_output = Command::new(pm).arg("upgrade").arg("--simulate").output();
-        let packages: Vec<String> = match sim_output {
-            Ok(output) => String::from_utf8_lossy(&output.stdout).lines().filter(|l| l.starts_with("Inst ")).filter_map(|l| l.split_whitespace().nth(1).map(String::from)).collect(),
-            Err(e) => return (false, format!("Ошибка: {}", e)),
-        };
-        if packages.is_empty() { return (true, "Система уже обновлена".to_string()); }
-        let total = packages.len(); let mut done = 0; let mut all_ok = true;
-        for pkg in &packages {
-            let mut cmd = Command::new(pm);
-            cmd.arg("install").arg("--download-only").arg("-y").arg(format!("-o Dir::Cache::Archives={}", download_dir)).arg(pkg);
-            if let Ok(s) = run_process(cmd, tx) { if !s.success() { all_ok = false; } } else { all_ok = false; }
-            done += 1;
-            let _ = tx.send(LogEvent::Progress(done as f64 / total as f64, format!("{} / {}", done, total)));
-        }
-        if all_ok { (true, format!("Скачано пакетов: {}", packages.len())) } else { (false, "Некоторые пакеты не удалось скачать".to_string()) }
+    let mut cmd = Command::new("dnf");
+    cmd.arg("upgrade").arg("--downloadonly").arg(format!("--destdir={}", download_dir)).arg("-y");
+    match run_process(cmd, tx) {
+        Ok(s) if s.success() => (true, "Обновления скачаны".to_string()),
+        Ok(_s) => (false, "Ошибка скачивания".to_string()),
+        Err(e) => (false, format!("Не удалось запустить dnf: {}", e)),
     }
 }
 
-fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn download_packages(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
-    let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
-
-    if os_type == "rosa" {
-        let mut cmd = Command::new(pm);
-        cmd.arg("download").arg("--resolve").arg("--alldeps")
-            .arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386")
-            .arg(format!("--destdir={}", download_dir));
-        for pkg in packages { cmd.arg(pkg); }
-        match run_process(cmd, tx) {
-            Ok(s) if s.success() => (true, "Пакеты скачаны".to_string()),
-            Ok(_s) => (false, "Ошибка скачивания".to_string()),
-            Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
-        }
-    } else {
-        // Alt Linux: используем apt-get download, который скачивает .rpm прямо в current_dir
-        let mut downloaded = 0;
-        let mut skipped = 0;
-
-        for pkg in packages {
-            let _ = tx.send(LogEvent::Line(format!("Пробую скачать {}...", pkg)));
-
-            let mut cmd = Command::new(pm);
-            cmd.current_dir(download_dir).arg("download").arg(pkg);
-
-            match run_process(cmd, tx) {
-                Ok(s) if s.success() => {
-                    // Проверяем, что файл реально появился в папке
-                    let files = find_packages_flat(download_dir, pkg, &detect_arch(), os_type);
-                    if !files.is_empty() {
-                        downloaded += 1;
-                        let _ = tx.send(LogEvent::Line(format!("[OK] {} скачан ({} файлов)", pkg, files.len())));
-                    } else {
-                        skipped += 1;
-                        let _ = tx.send(LogEvent::Line(format!("[!] {} скачан, но не найден по шаблону", pkg)));
-                    }
-                }
-                Ok(_s) => {
-                    skipped += 1;
-                    let _ = tx.send(LogEvent::Line(format!("[!] {} нет в репозитории Alt Linux (проверьте имя пакета)", pkg)));
-                }
-                Err(e) => {
-                    skipped += 1;
-                    let _ = tx.send(LogEvent::Line(format!("[!] Ошибка при скачивании {}: {}", pkg, e)));
-                }
-            }
-        }
-
-        let local = find_packages_flat(download_dir, "", &detect_arch(), os_type);
-        let msg = format!("Скачано: {}, пропущено: {}, локальных: {}", downloaded, skipped, local.len());
-        if downloaded > 0 || !local.is_empty() { (true, msg) } else { (false, msg) }
+    let mut cmd = Command::new("dnf");
+    cmd.arg("download").arg("--resolve").arg("--alldeps")
+        .arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386")
+        .arg(format!("--destdir={}", download_dir));
+    for pkg in packages { cmd.arg(pkg); }
+    match run_process(cmd, tx) {
+        Ok(s) if s.success() => (true, "Пакеты скачаны".to_string()),
+        Ok(_s) => (false, "Ошибка скачивания".to_string()),
+        Err(e) => (false, format!("Не удалось запустить dnf: {}", e)),
     }
 }
 
 // ==================== УСТАНОВКА ИЗ ПАПКИ ====================
 
-fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
-    let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
-    let files = find_packages_flat(download_dir, "", &system_arch, os_type);
+    let files = find_packages_flat(download_dir, "", &system_arch);
     if files.is_empty() {
-        return (false, format!("В папке '{}' нет совместимых .rpm для {}", download_dir, os_type));
+        return (false, format!("В папке '{}' нет .rpm файлов", download_dir));
     }
-    let _ = tx.send(LogEvent::Line(format!("Найдено {} пакетов для установки (ОС: {})", files.len(), os_type)));
+    let _ = tx.send(LogEvent::Line(format!("Найдено {} пакетов для установки", files.len())));
 
     let mut installed = 0;
     for chunk in files.chunks(80) {
-        let mut cmd = Command::new(pm);
-        if os_type == "rosa" {
-            cmd.arg("install").arg("-y").arg("--allowerasing").arg("--nobest");
-        } else {
-            cmd.arg("install").arg("-f").arg("-y");
-        }
+        let mut cmd = Command::new("dnf");
+        cmd.arg("install").arg("-y").arg("--allowerasing").arg("--nobest");
         for file in chunk { cmd.arg(file); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => { installed += chunk.len(); }
             Ok(_s) => { /* пропускаем, продолжаем со следующими батчами */ }
             Err(e) => { let _ = tx.send(LogEvent::Line(format!("[X] Ошибка: {}", e))); }
         }
-    }
-    if os_type == "alt" {
-        let mut fix = Command::new(pm);
-        fix.arg("install").arg("-f").arg("-y");
-        let _ = run_process(fix, tx);
     }
     if installed > 0 {
         (true, format!("Установлено пакетов: {}", installed))
@@ -862,56 +678,32 @@ fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogE
 
 // ==================== КРИПТОПРО + ГИА ====================
 
-fn download_package_to_folder(package_name: &str, folder: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn download_package_to_folder(package_name: &str, folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(folder);
-    let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
-    let package_names = get_package_name_for_os(package_name, os_type);
-    for pkg_name in &package_names {
-        let _ = tx.send(LogEvent::Line(format!("Пробую скачать {}...", pkg_name)));
-        if os_type == "rosa" {
-            let mut cmd = Command::new(pm);
-            cmd.arg("download").arg("--resolve").arg("--alldeps").arg(format!("--destdir={}", folder)).arg(pkg_name);
-            match run_process(cmd, tx) {
-                Ok(s) if s.success() => return (true, format!("{} скачан", pkg_name)),
-                Ok(_s) => { let _ = tx.send(LogEvent::Line(format!("[!] {} не найден...", pkg_name))); continue; }
-                Err(e) => return (false, format!("Не удалось скачать {}: {}", pkg_name, e)),
-            }
-        } else {
-            let mut cmd = Command::new(pm);
-            cmd.current_dir(folder).arg("download").arg(pkg_name);
-            match run_process(cmd, tx) {
-                Ok(s) if s.success() => {
-                    let files = find_packages_flat(folder, pkg_name, &detect_arch(), os_type);
-                    if !files.is_empty() { return (true, format!("{} скачан", pkg_name)); }
-                }
-                _ => {}
-            }
-            let cache_dir = "/var/cache/apt/archives";
-            let mut cmd = Command::new(pm);
-            cmd.arg("install").arg("--download-only").arg(pkg_name);
-            match run_process(cmd, tx) {
-                Ok(s) if s.success() => {
-                    let copy_cmd = format!("find {} -name '*.rpm' -exec cp {{}} {} \\; 2>/dev/null", cache_dir, folder);
-                    let _ = Command::new("sh").arg("-c").arg(&copy_cmd).status();
-                    let files = find_packages_flat(folder, pkg_name, &detect_arch(), os_type);
-                    if !files.is_empty() { return (true, format!("{} скачан через кэш", pkg_name)); }
-                }
-                Ok(_s) => { let _ = tx.send(LogEvent::Line(format!("[!] {} не найден...", pkg_name))); continue; }
-                Err(e) => return (false, format!("Не удалось скачать {}: {}", pkg_name, e)),
+    let mut cmd = Command::new("dnf");
+    cmd.arg("download").arg("--resolve").arg("--alldeps")
+        .arg(format!("--destdir={}", folder))
+        .arg(package_name);
+    match run_process(cmd, tx) {
+        Ok(s) if s.success() => {
+            let files = find_packages_flat(folder, package_name, &detect_arch());
+            if !files.is_empty() {
+                (true, format!("{} скачан", package_name))
+            } else {
+                (false, format!("{} скачан, но файлы не найдены", package_name))
             }
         }
+        Ok(_s) => (false, format!("{} не найден в репозитории", package_name)),
+        Err(e) => (false, format!("Не удалось скачать {}: {}", package_name, e)),
     }
-    (false, format!("Ни одно из имён пакета не найдено: {:?}", package_names))
 }
 
-fn install_local_packages(folder: &str, pattern: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
-    let files = find_packages_flat(folder, pattern, &detect_arch(), os_type);
+fn install_local_packages(folder: &str, pattern: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let files = find_packages_flat(folder, pattern, &detect_arch());
     if files.is_empty() { return (false, format!("Не найдено {}*.rpm в папке {}", pattern, folder)); }
     let _ = tx.send(LogEvent::Line(format!("Устанавливаю {} пакетов: {}", files.len(), pattern)));
-    let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
-    let mut cmd = Command::new(pm);
-    if os_type == "rosa" { cmd.arg("install").arg("-y").arg("--allowerasing").arg("--nobest"); }
-    else { cmd.arg("install").arg("-f").arg("-y"); }
+    let mut cmd = Command::new("dnf");
+    cmd.arg("install").arg("-y").arg("--allowerasing").arg("--nobest");
     for file in &files { cmd.arg(file); }
     match run_process(cmd, tx) {
         Ok(s) if s.success() => (true, format!("{} установлены", pattern)),
@@ -920,7 +712,7 @@ fn install_local_packages(folder: &str, pattern: &str, os_type: &str, tx: &mpsc:
     }
 }
 
-fn install_cryptopro_csp(crypto_subdir: &str, _os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn install_cryptopro_csp(crypto_subdir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let install_script = Path::new(crypto_subdir).join("install.sh");
     let uninstall_script = Path::new(crypto_subdir).join("uninstall.sh");
     if !install_script.exists() { return (false, "В linux-amd64/ не найден install.sh КриптоПро".to_string()); }
@@ -935,70 +727,68 @@ fn install_cryptopro_csp(crypto_subdir: &str, _os_type: &str, tx: &mpsc::Sender<
     }
 }
 
-fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(crypto_dir);
     let _ = fs::create_dir_all(school_dir);
     let system_arch = detect_arch();
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 1/5: newt ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.0, "Шаг 1: newt...".to_string()));
-    let newt_names = get_package_name_for_os("newt", os_type);
-    let newt_installed = newt_names.iter().any(|name| is_package_installed(name, os_type));
-    if !newt_installed && find_packages_flat(crypto_dir, "newt", &system_arch, os_type).is_empty() {
+    let newt_installed = is_package_installed("newt");
+    if !newt_installed && find_packages_flat(crypto_dir, "newt", &system_arch).is_empty() {
         let _ = tx.send(LogEvent::Line("newt не установлен — скачиваю...".to_string()));
-        let (ok, msg) = download_package_to_folder("newt", crypto_dir, os_type, tx);
+        let (ok, msg) = download_package_to_folder("newt", crypto_dir, tx);
         if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
     } else if newt_installed {
         let _ = tx.send(LogEvent::Line("[OK] newt уже установлен".to_string()));
     }
     if !newt_installed {
-        let (ok, msg) = install_local_packages(crypto_dir, "newt", os_type, tx);
+        let (ok, msg) = install_local_packages(crypto_dir, "newt", tx);
         if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
     }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 2.1/5: pcsc-lite + pcsc-lite-ccid ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.15, "Шаг 2.1: pcsc-lite...".to_string()));
     for pkg in &["pcsc-lite", "pcsc-lite-ccid"] {
-        let pkg_names = get_package_name_for_os(pkg, os_type);
-        let pkg_installed = pkg_names.iter().any(|name| is_package_installed(name, os_type));
-        if !pkg_installed && find_packages_flat(crypto_dir, pkg, &system_arch, os_type).is_empty() {
-            let (ok, msg) = download_package_to_folder(pkg, crypto_dir, os_type, tx);
+        let pkg_installed = is_package_installed(pkg);
+        if !pkg_installed && find_packages_flat(crypto_dir, pkg, &system_arch).is_empty() {
+            let (ok, msg) = download_package_to_folder(pkg, crypto_dir, tx);
             if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
         } else if pkg_installed {
             let _ = tx.send(LogEvent::Line(format!("[OK] {} уже установлен", pkg)));
         }
         if !pkg_installed {
-            let (ok, msg) = install_local_packages(crypto_dir, pkg, os_type, tx);
+            let (ok, msg) = install_local_packages(crypto_dir, pkg, tx);
             if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
         }
     }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 2.2/5: librtpkcs11ecp ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.3, "Шаг 2.2: librtpkcs11ecp...".to_string()));
-    let lib_installed = is_package_installed("librtpkcs11ecp", os_type);
-    if !lib_installed && find_packages_flat(crypto_dir, "librtpkcs11ecp", &system_arch, os_type).is_empty() {
-        let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, os_type, tx);
+    let lib_installed = is_package_installed("librtpkcs11ecp");
+    if !lib_installed && find_packages_flat(crypto_dir, "librtpkcs11ecp", &system_arch).is_empty() {
+        let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, tx);
         if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
     } else if lib_installed {
         let _ = tx.send(LogEvent::Line("[OK] librtpkcs11ecp уже установлен".to_string()));
     }
     if !lib_installed {
-        let (ok, msg) = install_local_packages(crypto_dir, "librtpkcs11ecp", os_type, tx);
+        let (ok, msg) = install_local_packages(crypto_dir, "librtpkcs11ecp", tx);
         if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
     }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 3/5: КриптоПро CSP ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.5, "Шаг 3: КриптоПро...".to_string()));
     let crypto_subdir = Path::new(crypto_dir).join("linux-amd64");
-    let (ok, msg) = install_cryptopro_csp(&crypto_subdir.to_string_lossy(), os_type, tx);
+    let (ok, msg) = install_cryptopro_csp(&crypto_subdir.to_string_lossy(), tx);
     if !ok { return (false, format!("Шаг 3 (КриптоПро): {}", msg)); }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 4/5: GIA11_PPE ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.75, "Шаг 4: GIA11_PPE...".to_string()));
-    if find_packages_flat(crypto_dir, "GIA11_PPE", &system_arch, os_type).is_empty() {
+    if find_packages_flat(crypto_dir, "GIA11_PPE", &system_arch).is_empty() {
         return (false, "GIA11_PPE*.rpm не найден в cryptopro_gia/. Положите файл и повторите.".to_string());
     }
-    let (ok, msg) = install_local_packages(crypto_dir, "GIA11_PPE", os_type, tx);
+    let (ok, msg) = install_local_packages(crypto_dir, "GIA11_PPE", tx);
     if !ok { return (false, format!("Шаг 4 (GIA11_PPE): {}", msg)); }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 5/5: Запуск pcscd ===".to_string()));
@@ -1013,72 +803,53 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, os_type: &str, tx: 
     (true, "Установлено: newt, pcsc-lite, librtpkcs11ecp, КриптоПро CSP, GIA11_PPE".to_string())
 }
 
-fn get_packages_for_os(os_type: &str) -> Vec<&'static str> {
-    match os_type {
-        "rosa" => vec!["task-koge", "r7-office", "notepadqq"],
-        "alt" => vec![
-            // Точные имена пакетов в репозитории Alt Linux p10/p11
-            "kumir2",
-            "python3-modules-tkinter",
-            "fpc",
-            "lazarus",
-            "geany",
-            "libreoffice",
-            "chromium",
-            "gimp",
-        ],
-        _ => vec!["task-koge"],
-    }
+fn get_packages() -> Vec<&'static str> {
+    vec!["task-koge", "r7-office", "notepadqq"]
 }
 
 // ==================== ДИСПЕТЧЕР КОМАНД ====================
 
-fn run_command(cmd_id: &str, os_type: String, tx: &mpsc::Sender<LogEvent>) {
-    ensure_directories(&os_type);
+fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
+    ensure_directories();
 
     let needs_prepare = matches!(cmd_id,
         "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia");
     if needs_prepare {
-        let (ok, msg) = prepare_environment(&os_type, tx);
+        let (ok, msg) = prepare_environment(tx);
         if !ok {
             let _ = tx.send(LogEvent::Done(false, format!("Подготовка окружения: {}", msg)));
             return;
         }
     }
 
-    let base_packages_dir = get_school_packages_dir();
-    let base_updates_dir = get_updates_dir();
+    let download_dir = get_school_packages_dir();
+    let updates_dir = get_updates_dir();
     let cert_dir = get_cert_dir();
     let crypto_dir = get_crypto_dir();
     let system_arch = detect_arch();
 
-    let download_dir = get_os_subdir(&base_packages_dir, &os_type);
-    let updates_dir = get_os_subdir(&base_updates_dir, &os_type);
-
     let result: (bool, String) = match cmd_id {
-        "setup_env" => prepare_environment(&os_type, tx),
-        "download_updates" => download_updates(&updates_dir, &os_type, tx),
+        "setup_env" => prepare_environment(tx),
+        "download_updates" => download_updates(&updates_dir, tx),
         "install_updates" => {
             if !Path::new(&updates_dir).exists() { (false, "Папка не найдена. Сначала скачайте обновления.".to_string()) }
-            else { install_from_folder(&updates_dir, &os_type, tx) }
+            else { install_from_folder(&updates_dir, tx) }
         }
-        "download_packages" => download_packages(&get_packages_for_os(&os_type), &download_dir, &os_type, tx),
+        "download_packages" => download_packages(&get_packages(), &download_dir, tx),
         "install_packages" => {
             if !Path::new(&download_dir).exists() { (false, "Папка не найдена. Сначала скачайте пакеты.".to_string()) }
-            else { install_from_folder(&download_dir, &os_type, tx) }
+            else { install_from_folder(&download_dir, tx) }
         }
-        "install_cryptopro_gia" => install_cryptopro_gia(&crypto_dir, &download_dir, &os_type, tx),
+        "install_cryptopro_gia" => install_cryptopro_gia(&crypto_dir, &download_dir, tx),
         "detect_os" => {
-            print_setup_instructions(&os_type, tx);
-            let mut info = format!("ОС: {} | Арх: {}", os_type, system_arch);
+            print_setup_instructions(tx);
+            let mut info = format!("ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
             info += &format!("\n  Прокси: {}", get_proxy_url());
             info += &format!("\n  cer: {}", cert_dir);
-            info += &format!("\n  school_packages/rosa: {} ({} .rpm)", Path::new(&get_os_subdir(&base_packages_dir, "rosa")).exists(), find_packages_flat(&get_os_subdir(&base_packages_dir, "rosa"), "", &system_arch, "rosa").len());
-            info += &format!("\n  school_packages/alt: {} ({} .rpm)", Path::new(&get_os_subdir(&base_packages_dir, "alt")).exists(), find_packages_flat(&get_os_subdir(&base_packages_dir, "alt"), "", &system_arch, "alt").len());
-            info += &format!("\n  updates/rosa: {}", Path::new(&get_os_subdir(&base_updates_dir, "rosa")).exists());
-            info += &format!("\n  updates/alt: {}", Path::new(&get_os_subdir(&base_updates_dir, "alt")).exists());
+            info += &format!("\n  school_packages: {} ({} .rpm)", Path::new(&download_dir).exists(), find_packages_flat(&download_dir, "", &system_arch).len());
+            info += &format!("\n  updates: {}", Path::new(&updates_dir).exists());
             info += &format!("\n  cryptopro_gia/linux-amd64/install.sh: {}", Path::new(&format!("{}/linux-amd64/install.sh", crypto_dir)).exists());
-            info += &format!("\n  .rpm в cryptopro_gia/: {}", find_packages_flat(&crypto_dir, "", &system_arch, &os_type).len());
+            info += &format!("\n  .rpm в cryptopro_gia/: {}", find_packages_flat(&crypto_dir, "", &system_arch).len());
             (true, info)
         }
         "exit" => (true, "Выход".to_string()),
@@ -1099,12 +870,12 @@ struct CommandItem {
 
 const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "detect_os", name: "[i ] Информация и инструкция", description: "Показывает структуру папок, что где лежит, и полную инструкцию по подготовке флешки. Папки создаются автоматически.", icon: "? " },
-    CommandItem { id: "setup_env", name: "[NET] Настроить прокси + сертификат", description: "Прокси в dnf.conf/apt.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' в системное хранилище и NSS Chromium.", icon: ">>" },
-    CommandItem { id: "download_updates", name: "[D ] Скачать обновления системы", description: "Скачивает обновления в updates/{ОС}/. Нужен интернет через прокси.", icon: "v " },
-    CommandItem { id: "install_updates", name: "[I ] Установить обновления", description: "Устанавливает из updates/{ОС}/ офлайн. Пакеты от другой ОС автоматически отфильтровываются.", icon: "^ " },
-    CommandItem { id: "download_packages", name: "[P ] Скачать пакеты", description: "На ROSA: task-koge+офис. На Alt: kumir2, python3, geany и др. Сохраняет в school_packages/{ОС}/.", icon: "[ ]" },
-    CommandItem { id: "install_packages", name: "[R ] Установить пакеты", description: "Устанавливает из school_packages/{ОС}/. Пакеты от другой ОС автоматически отфильтровываются.", icon: ">>" },
-    CommandItem { id: "install_cryptopro_gia", name: "[K ] Установить КриптоПро + ГИА", description: "5 шагов: newt -> pcsc-lite -> librtpkcs11ecp -> КриптоПро (из cryptopro_gia/linux-amd64/, общая для всех ОС) -> GIA11_PPE -> pcscd.", icon: "**" },
+    CommandItem { id: "setup_env", name: "[NET] Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' в системное хранилище и NSS Chromium.", icon: ">>" },
+    CommandItem { id: "download_updates", name: "[D ] Скачать обновления системы", description: "Скачивает обновления в updates/. Нужен интернет через прокси.", icon: "v " },
+    CommandItem { id: "install_updates", name: "[I ] Установить обновления", description: "Устанавливает из updates/ офлайн.", icon: "^ " },
+    CommandItem { id: "download_packages", name: "[P ] Скачать пакеты", description: "Скачивает task-koge + r7-office + notepadqq. Сохраняет в school_packages/.", icon: "[ ]" },
+    CommandItem { id: "install_packages", name: "[R ] Установить пакеты", description: "Устанавливает из school_packages/ офлайн.", icon: ">>" },
+    CommandItem { id: "install_cryptopro_gia", name: "[K ] Установить КриптоПро + ГИА", description: "5 шагов: newt -> pcsc-lite -> librtpkcs11ecp -> КриптоПро (из cryptopro_gia/linux-amd64/) -> GIA11_PPE -> pcscd.", icon: "**" },
     CommandItem { id: "exit", name: "[x ] Выход", description: "Завершить программу.", icon: "X " },
 ];
 
@@ -1113,7 +884,6 @@ struct App {
     list_state: ListState,
     status: String,
     is_running: bool,
-    os_type: String,
     arch: String,
     progress: f64,
     progress_label: String,
@@ -1126,14 +896,13 @@ impl App {
     fn new() -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
-        let os_type = detect_os();
         let arch = detect_arch();
-        ensure_directories(&os_type);
+        ensure_directories();
         App {
             selected: 0, list_state,
             status: "Готов к работе. Выберите [i] для инструкции.".to_string(),
             is_running: false,
-            os_type, arch,
+            arch,
             progress: 0.0, progress_label: String::new(),
             log_lines: Vec::new(), log_rx: None,
             first_run_shown: false,
@@ -1158,8 +927,7 @@ impl App {
         self.status = format!("> {}", cmd.name);
         self.log_lines.clear();
         let (tx, rx) = mpsc::channel::<LogEvent>();
-        let os_type = self.os_type.clone();
-        thread::spawn(move || { run_command(cmd.id, os_type, &tx); });
+        thread::spawn(move || { run_command(cmd.id, &tx); });
         self.log_rx = Some(rx);
     }
     fn poll_events(&mut self) {
@@ -1196,7 +964,7 @@ fn ui(f: &mut Frame, app: &App) {
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(" ШКОЛЬНЫЙ УСТАНОВЩИК ПО ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(format!("ОС: {} | Арх: {}", app.os_type.to_uppercase(), app.arch), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("ОС: МОС ОС | Арх: {}", app.arch), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
     ])])
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(header, chunks[0]);
@@ -1330,8 +1098,7 @@ fn main() -> io::Result<()> {
 
     if args.len() > 1 {
         let mode = args[1].trim_start_matches("--");
-        let os_type = detect_os();
-        ensure_directories(&os_type);
+        ensure_directories();
         let (tx, rx) = mpsc::channel::<LogEvent>();
         let cmd_id = match mode {
             "setup-env" => "setup_env",
@@ -1342,8 +1109,7 @@ fn main() -> io::Result<()> {
             "install-crypto-gia" => "install_cryptopro_gia",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
-        let os_c = os_type.clone();
-        thread::spawn(move || run_command(cmd_id, os_c, &tx));
+        thread::spawn(move || run_command(cmd_id, &tx));
         loop {
             match rx.recv() {
                 Ok(LogEvent::Line(s)) => println!("{}", s),
@@ -1369,9 +1135,8 @@ fn main() -> io::Result<()> {
     if !app.first_run_shown {
         app.first_run_shown = true;
         let (tx, rx) = mpsc::channel::<LogEvent>();
-        let os_type = app.os_type.clone();
         thread::spawn(move || {
-            run_command("detect_os", os_type, &tx);
+            run_command("detect_os", &tx);
         });
         app.log_rx = Some(rx);
     }
