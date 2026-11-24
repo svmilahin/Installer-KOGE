@@ -805,7 +805,7 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
         let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, tx);
         if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
     } else if lib_installed {
-        let _ = tx.send(LogEvent::Line("✅ librtpkcs11ecp уже установлен".to_string());
+        let _ = tx.send(LogEvent::Line("✅ librtpkcs11ecp уже установлен".to_string()));
     }
     if !lib_installed {
         let (ok, msg) = install_local_packages(crypto_dir, "librtpkcs11ecp", tx);
