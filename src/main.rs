@@ -419,6 +419,7 @@ fn is_package_installed(package_name: &str) -> bool {
 
 // ==================== ПОИСК ПАКЕТОВ ====================
 
+/// Ищет пакеты по точному префиксу имени (для установки батчами)
 fn find_packages_flat(folder: &str, pattern: &str, system_arch: &str) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
     if let Ok(entries) = fs::read_dir(folder) {
@@ -429,6 +430,25 @@ fn find_packages_flat(folder: &str, pattern: &str, system_arch: &str) -> Vec<Str
             if name == "README.txt" { continue; }
             if !name.ends_with(".rpm") { continue; }
             if !pattern.is_empty() && !name.starts_with(pattern) { continue; }
+            if !is_package_for_arch(&name, system_arch) { continue; }
+            result.push(path.to_string_lossy().to_string());
+        }
+    }
+    result
+}
+
+/// Ищет пакеты по подстроке в имени (case-insensitive)
+/// Нужно для пакетов типа lib64pcsc-lite-ccid, где ищем "pcsc-lite-ccid"
+fn find_packages_by_substring(folder: &str, substring: &str, system_arch: &str) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(folder) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() { continue; }
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if name == "README.txt" { continue; }
+            if !name.ends_with(".rpm") { continue; }
+            if !substring.is_empty() && !name.to_lowercase().contains(&substring.to_lowercase()) { continue; }
             if !is_package_for_arch(&name, system_arch) { continue; }
             result.push(path.to_string_lossy().to_string());
         }
@@ -626,14 +646,17 @@ fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
 
-    // Получаем абсолютный путь, чтобы dnf точно скачал туда
     let abs_path = fs::canonicalize(download_dir)
         .unwrap_or_else(|_| Path::new(download_dir).to_path_buf());
     let _ = tx.send(LogEvent::Line(format!("📥 Скачиваю обновления в: {}", abs_path.display())));
 
+    // Исключаем i686/i586/i386 — они не нужны на x86_64 системе
     let mut cmd = Command::new("dnf");
     cmd.arg("upgrade")
         .arg("--downloadonly")
+        .arg("--exclude=*.i686")
+        .arg("--exclude=*.i586")
+        .arg("--exclude=*.i386")
         .arg(format!("--destdir={}", abs_path.display()))
         .arg("-y");
 
@@ -698,20 +721,22 @@ fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool
 fn download_package_to_folder(package_name: &str, folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(folder);
 
+    // ВАЖНО: без --resolve --alldeps, чтобы не тянуть кучу зависимостей (perl-*, lib64-* и т.д.)
     let mut cmd = Command::new("dnf");
-    cmd.arg("download").arg("--resolve").arg("--alldeps")
+    cmd.arg("download")
         .arg(format!("--destdir={}", folder))
         .arg(package_name);
 
     match run_process(cmd, tx) {
         Ok(s) if s.success() => {
-            let files = find_packages_flat(folder, package_name, &detect_arch());
+            // Ищем файлы по подстроке в имени (а не по starts_with)
+            let files = find_packages_by_substring(folder, package_name, &detect_arch());
             if !files.is_empty() {
-                return (true, format!("{} скачан", package_name));
+                return (true, format!("{} скачан ({} файлов)", package_name, files.len()));
             }
             // Fallback: ищем в кэше dnf
             let _ = tx.send(LogEvent::Line("Файлы не в папке, ищу в кэше dnf...".to_string()));
-            let cache_search = format!("find /var/cache/dnf -name '{}*.rpm' -type f 2>/dev/null | head -5", package_name);
+            let cache_search = format!("find /var/cache/dnf -name '*{}*.rpm' -type f 2>/dev/null | head -5", package_name);
             if let Ok(output) = Command::new("sh").arg("-c").arg(&cache_search).output() {
                 let cache_files = String::from_utf8_lossy(&output.stdout);
                 if !cache_files.trim().is_empty() {
@@ -720,7 +745,7 @@ fn download_package_to_folder(package_name: &str, folder: &str, tx: &mpsc::Sende
                             let _ = Command::new("cp").arg(cache_file).arg(folder).status();
                         }
                     }
-                    let files = find_packages_flat(folder, package_name, &detect_arch());
+                    let files = find_packages_by_substring(folder, package_name, &detect_arch());
                     if !files.is_empty() {
                         return (true, format!("{} скачан через кэш", package_name));
                     }
@@ -734,8 +759,9 @@ fn download_package_to_folder(package_name: &str, folder: &str, tx: &mpsc::Sende
 }
 
 fn install_local_packages(folder: &str, pattern: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
-    let files = find_packages_flat(folder, pattern, &detect_arch());
-    if files.is_empty() { return (false, format!("❌ Не найдено {}*.rpm в папке {}", pattern, folder)); }
+    // Используем поиск по подстроке для pattern (чтобы найти lib64pcsc-lite-ccid при pattern="pcsc-lite-ccid")
+    let files = find_packages_by_substring(folder, pattern, &detect_arch());
+    if files.is_empty() { return (false, format!("❌ Не найдено *{}*.rpm в папке {}", pattern, folder)); }
     let _ = tx.send(LogEvent::Line(format!("Устанавливаю {} пакетов: {}", files.len(), pattern)));
     let mut cmd = Command::new("dnf");
     cmd.arg("install").arg("-y").arg("--allowerasing").arg("--nobest");
@@ -770,7 +796,7 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
     let _ = tx.send(LogEvent::Line("=== ШАГ 1/5: newt ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.0, "Шаг 1: newt...".to_string()));
     let newt_installed = is_package_installed("newt");
-    if !newt_installed && find_packages_flat(crypto_dir, "newt", &system_arch).is_empty() {
+    if !newt_installed && find_packages_by_substring(crypto_dir, "newt", &system_arch).is_empty() {
         let _ = tx.send(LogEvent::Line("newt не установлен — скачиваю...".to_string()));
         let (ok, msg) = download_package_to_folder("newt", crypto_dir, tx);
         if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
@@ -786,7 +812,7 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
     let _ = tx.send(LogEvent::Progress(0.15, "Шаг 2.1: pcsc-lite...".to_string()));
     for pkg in &["pcsc-lite", "pcsc-lite-ccid"] {
         let pkg_installed = is_package_installed(pkg);
-        if !pkg_installed && find_packages_flat(crypto_dir, pkg, &system_arch).is_empty() {
+        if !pkg_installed && find_packages_by_substring(crypto_dir, pkg, &system_arch).is_empty() {
             let (ok, msg) = download_package_to_folder(pkg, crypto_dir, tx);
             if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
         } else if pkg_installed {
@@ -801,7 +827,7 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
     let _ = tx.send(LogEvent::Line("=== ШАГ 2.2/5: librtpkcs11ecp ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.3, "Шаг 2.2: librtpkcs11ecp...".to_string()));
     let lib_installed = is_package_installed("librtpkcs11ecp");
-    if !lib_installed && find_packages_flat(crypto_dir, "librtpkcs11ecp", &system_arch).is_empty() {
+    if !lib_installed && find_packages_by_substring(crypto_dir, "librtpkcs11ecp", &system_arch).is_empty() {
         let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, tx);
         if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
     } else if lib_installed {
@@ -820,7 +846,7 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 4/5: GIA11_PPE ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.75, "Шаг 4: GIA11_PPE...".to_string()));
-    if find_packages_flat(crypto_dir, "GIA11_PPE", &system_arch).is_empty() {
+    if find_packages_by_substring(crypto_dir, "GIA11_PPE", &system_arch).is_empty() {
         return (false, "❌ GIA11_PPE*.rpm не найден в cryptopro_gia/. Положите файл и повторите.".to_string());
     }
     let (ok, msg) = install_local_packages(crypto_dir, "GIA11_PPE", tx);
@@ -915,7 +941,7 @@ struct CommandItem {
 const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, что где лежит, и полную инструкцию по подготовке флешки. Папки создаются автоматически.", icon: "ℹ" },
     CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' в системное хранилище и NSS Chromium.", icon: "🌐" },
-    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Нужен интернет через прокси.", icon: "⬇" },
+    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Исключает i686 пакеты. Нужен интернет через прокси.", icon: "⬇" },
     CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ офлайн.", icon: "⬆" },
     CommandItem { id: "download_packages", name: "Скачать пакеты", description: "Скачивает task-koge + r7-office + notepadqq. Сохраняет в school_packages/.", icon: "📦" },
     CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ офлайн.", icon: "🚀" },
@@ -1018,7 +1044,6 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[1]);
 
-    // Рендер меню: иконка + имя (без дублирования)
     let items: Vec<ListItem> = COMMANDS.iter().enumerate().map(|(i, cmd)| {
         let style = if i == app.selected {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
