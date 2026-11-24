@@ -284,9 +284,10 @@ fn ensure_directories(os_type: &str) {
     let crypto_dir = get_crypto_dir();
     let cert_dir = get_cert_dir();
 
-    let dirs_with_readme: Vec<(&str, &str)> = vec![
+    // ВАЖНО: тип кортежа (String, &str), т.к. пути — это String
+    let dirs_with_readme: Vec<(String, &str)> = vec![
         (
-            &format!("{}/rosa", base_packages),
+            format!("{}/rosa", base_packages),
             "ПАКЕТЫ ДЛЯ МОС ОС (ROSA)\n\
              ========================================\n\
              Сюда кладите .rpm пакеты для МОС ОС / РОСА.\n\
@@ -303,7 +304,7 @@ fn ensure_directories(os_type: &str) {
              3. Скопируйте папку school_packages/rosa/ на флешку"
         ),
         (
-            &format!("{}/alt", base_packages),
+            format!("{}/alt", base_packages),
             "ПАКЕТЫ ДЛЯ ALT LINUX EDUCATION\n\
              ========================================\n\
              Сюда кладите .rpm пакеты для Alt Linux Education.\n\
@@ -330,7 +331,7 @@ fn ensure_directories(os_type: &str) {
              3. Скопируйте school_packages/alt/ на флешку"
         ),
         (
-            &format!("{}/rosa", base_updates),
+            format!("{}/rosa", base_updates),
             "ОБНОВЛЕНИЯ ДЛЯ МОС ОС (ROSA)\n\
              ========================================\n\
              Сюда автоматически скачиваются обновления системы.\n\
@@ -342,7 +343,7 @@ fn ensure_directories(os_type: &str) {
              sudo ./school-installer --install-updates"
         ),
         (
-            &format!("{}/alt", base_updates),
+            format!("{}/alt", base_updates),
             "ОБНОВЛЕНИЯ ДЛЯ ALT LINUX EDUCATION\n\
              ========================================\n\
              Сюда автоматически скачиваются обновления системы.\n\
@@ -354,7 +355,7 @@ fn ensure_directories(os_type: &str) {
              sudo ./school-installer --install-updates"
         ),
         (
-            &format!("{}/linux-amd64", crypto_dir),
+            format!("{}/linux-amd64", crypto_dir),
             "КРИПТОПРО CSP — ДИСТРИБУТИВ\n\
              ========================================\n\
              ОДНА общая папка для МОС ОС и Alt Linux (оба используют RPM).\n\
@@ -379,7 +380,7 @@ fn ensure_directories(os_type: &str) {
              kc2 используйте только если точно знаете, зачем."
         ),
         (
-            crypto_dir,
+            crypto_dir.clone(),
             "КРИПТОПРО + ГИА — ДОПОЛНИТЕЛЬНЫЕ ПАКЕТЫ\n\
              ========================================\n\
              Корень папки cryptopro_gia/ — сюда кладите:\n\
@@ -441,29 +442,29 @@ fn print_setup_instructions(os_type: &str, tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("1. school_packages/ — пакеты для установки".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   ├── rosa/   — для МОС ОС ({})", Path::new(&format!("{}/rosa", base_packages)).exists())));
-    let _ = tx.send(LogEvent::Line(format!("   └── alt/    — для Alt Linux ({})", Path::new(&format!("{}/alt", base_packages)).exists())));
+    let _ = tx.send(LogEvent::Line(format!("   +-- rosa/   -- для МОС ОС ({})", Path::new(&format!("{}/rosa", base_packages)).exists())));
+    let _ = tx.send(LogEvent::Line(format!("   +-- alt/    -- для Alt Linux ({})", Path::new(&format!("{}/alt", base_packages)).exists())));
     let _ = tx.send(LogEvent::Line("   В каждой папке — .rpm файлы для своей ОС".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("2. updates/ — обновления системы".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   ├── rosa/   — для МОС ОС ({})", Path::new(&format!("{}/rosa", base_updates)).exists())));
-    let _ = tx.send(LogEvent::Line(format!("   └── alt/    — для Alt Linux ({})", Path::new(&format!("{}/alt", base_updates)).exists())));
+    let _ = tx.send(LogEvent::Line(format!("   +-- rosa/   -- для МОС ОС ({})", Path::new(&format!("{}/rosa", base_updates)).exists())));
+    let _ = tx.send(LogEvent::Line(format!("   +-- alt/    -- для Alt Linux ({})", Path::new(&format!("{}/alt", base_updates)).exists())));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("3. cryptopro_gia/ — КриптоПро + ГИА (ОБЩАЯ для всех ОС)".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   ├── linux-amd64/  — дистрибутив КриптоПро ({})", Path::new(&format!("{}/linux-amd64", crypto_dir)).exists())));
-    let _ = tx.send(LogEvent::Line("   │   ├── install.sh        (ОБЯЗАТЕЛЬНО)"));
-    let _ = tx.send(LogEvent::Line("   │   ├── uninstall.sh      (ОБЯЗАТЕЛЬНО)"));
-    let _ = tx.send(LogEvent::Line("   │   └── *.rpm             (все из архива КриптоПро)"));
-    let _ = tx.send(LogEvent::Line("   ├── newt-*.rpm            (или libnewt для Alt)"));
-    let _ = tx.send(LogEvent::Line("   ├── pcsc-lite-*.rpm       (демон смарт-карт)"));
-    let _ = tx.send(LogEvent::Line("   ├── librtpkcs11ecp-*.rpm  (токены Рутокен/Jacarta)"));
-    let _ = tx.send(LogEvent::Line("   └── GIA11_PPE-*.rpm       (платформа экзамена)"));
+    let _ = tx.send(LogEvent::Line(format!("   +-- linux-amd64/  -- дистрибутив КриптоПро ({})", Path::new(&format!("{}/linux-amd64", crypto_dir)).exists())));
+    let _ = tx.send(LogEvent::Line("   |   +-- install.sh        (ОБЯЗАТЕЛЬНО)".to_string()));
+    let _ = tx.send(LogEvent::Line("   |   +-- uninstall.sh      (ОБЯЗАТЕЛЬНО)".to_string()));
+    let _ = tx.send(LogEvent::Line("   |   \\-- *.rpm             (все из архива КриптоПро)".to_string()));
+    let _ = tx.send(LogEvent::Line("   +-- newt-*.rpm            (или libnewt для Alt)".to_string()));
+    let _ = tx.send(LogEvent::Line("   +-- pcsc-lite-*.rpm       (демон смарт-карт)".to_string()));
+    let _ = tx.send(LogEvent::Line("   +-- librtpkcs11ecp-*.rpm  (токены Рутокен/Jacarta)".to_string()));
+    let _ = tx.send(LogEvent::Line("   \\-- GIA11_PPE-*.rpm       (платформа экзамена)".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("4. cer/ — корневые сертификаты".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   └── ca-root.crt     ({})", Path::new(&cert_dir).exists())));
+    let _ = tx.send(LogEvent::Line(format!("   \\-- ca-root.crt     ({})", Path::new(&cert_dir).exists())));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
@@ -841,7 +842,6 @@ fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogE
     let _ = tx.send(LogEvent::Line(format!("Найдено {} пакетов для установки (ОС: {})", files.len(), os_type)));
 
     let mut installed = 0;
-    let mut errors = 0;
     for chunk in files.chunks(80) {
         let mut cmd = Command::new(pm);
         if os_type == "rosa" {
@@ -852,8 +852,8 @@ fn install_from_folder(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogE
         for file in chunk { cmd.arg(file); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => { installed += chunk.len(); }
-            Ok(_s) => { errors += 1; }
-            Err(e) => { errors += 1; let _ = tx.send(LogEvent::Line(format!("[X] Ошибка: {}", e))); }
+            Ok(_s) => { /* пропускаем, продолжаем со следующими батчами */ }
+            Err(e) => { let _ = tx.send(LogEvent::Line(format!("[X] Ошибка: {}", e))); }
         }
     }
     if os_type == "alt" {
