@@ -309,19 +309,14 @@ fn ensure_directories(os_type: &str) {
              ========================================\n\
              Сюда кладите .rpm пакеты для Alt Linux Education.\n\
              \n\
-             Рекомендуемые пакеты (найдите через apt-cache search):\n\
+             Рекомендуемые пакеты (точные имена из репозитория p10/p11):\n\
              - kumir2-*.rpm           (КуМир — школьный алгоритмический язык)\n\
-             - python3-*.rpm          (Python 3)\n\
-             - python3-tkinter-*.rpm  (Tkinter для Python)\n\
-             - python3-idle-*.rpm     (IDLE — IDE для Python)\n\
-             - pascalabcnet-*.rpm     (PascalABC.NET, если есть в репо)\n\
-             - fpc-*.rpm              (Free Pascal — запасной вариант)\n\
+             - python3-modules-tkinter-*.rpm (Tkinter для Python 3)\n\
+             - fpc-*.rpm              (Free Pascal Compiler)\n\
              - lazarus-*.rpm          (Lazarus IDE)\n\
              - geany-*.rpm            (лёгкий редактор кода)\n\
-             - codeblocks-*.rpm       (IDE для C++)\n\
              - libreoffice-*.rpm      (офисный пакет)\n\
              - chromium-*.rpm         (браузер)\n\
-             - notepadqq-*.rpm        (редактор кода)\n\
              - gimp-*.rpm             (графический редактор)\n\
              \n\
              Как получить:\n\
@@ -775,6 +770,7 @@ fn download_updates(download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEven
 fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
     let pm = if os_type == "rosa" { "dnf" } else { "apt-get" };
+
     if os_type == "rosa" {
         let mut cmd = Command::new(pm);
         cmd.arg("download").arg("--resolve").arg("--alldeps")
@@ -787,9 +783,10 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
             Err(e) => (false, format!("Не удалось запустить {}: {}", pm, e)),
         }
     } else {
-        // Alt Linux: используем apt-get download — скачивает .rpm ПРЯМО в текущую папку
+        // Alt Linux: используем apt-get download, который скачивает .rpm прямо в current_dir
         let mut downloaded = 0;
         let mut skipped = 0;
+
         for pkg in packages {
             let _ = tx.send(LogEvent::Line(format!("Пробую скачать {}...", pkg)));
 
@@ -798,7 +795,7 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
 
             match run_process(cmd, tx) {
                 Ok(s) if s.success() => {
-                    // Проверяем, что файл реально появился
+                    // Проверяем, что файл реально появился в папке
                     let files = find_packages_flat(download_dir, pkg, &detect_arch(), os_type);
                     if !files.is_empty() {
                         downloaded += 1;
@@ -810,14 +807,15 @@ fn download_packages(packages: &[&str], download_dir: &str, os_type: &str, tx: &
                 }
                 Ok(_s) => {
                     skipped += 1;
-                    let _ = tx.send(LogEvent::Line(format!("[!] {} нет в репозитории Alt Linux", pkg)));
+                    let _ = tx.send(LogEvent::Line(format!("[!] {} нет в репозитории Alt Linux (проверьте имя пакета)", pkg)));
                 }
                 Err(e) => {
                     skipped += 1;
-                    let _ = tx.send(LogEvent::Line(format!("[!] Ошибка {}: {}", pkg, e)));
+                    let _ = tx.send(LogEvent::Line(format!("[!] Ошибка при скачивании {}: {}", pkg, e)));
                 }
             }
         }
+
         let local = find_packages_flat(download_dir, "", &detect_arch(), os_type);
         let msg = format!("Скачано: {}, пропущено: {}, локальных: {}", downloaded, skipped, local.len());
         if downloaded > 0 || !local.is_empty() { (true, msg) } else { (false, msg) }
@@ -1019,9 +1017,15 @@ fn get_packages_for_os(os_type: &str) -> Vec<&'static str> {
     match os_type {
         "rosa" => vec!["task-koge", "r7-office", "notepadqq"],
         "alt" => vec![
-            "kumir2", "python3", "python3-tkinter", "python3-idle",
-            "pascalabcnet", "fpc", "lazarus", "geany", "codeblocks",
-            "libreoffice", "chromium", "notepadqq", "gimp",
+            // Точные имена пакетов в репозитории Alt Linux p10/p11
+            "kumir2",
+            "python3-modules-tkinter",
+            "fpc",
+            "lazarus",
+            "geany",
+            "libreoffice",
+            "chromium",
+            "gimp",
         ],
         _ => vec!["task-koge"],
     }
