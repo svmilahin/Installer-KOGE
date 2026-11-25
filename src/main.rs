@@ -25,7 +25,8 @@ use std::time::Duration;
 
 const SETTINGS_FILE: &str = "school-installer.conf";
 const LOG_FILE: &str = "school-installer.log";
-const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 МБ
+const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+const CERT_FILE_NAME: &str = "ca-root.crt";
 
 const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
 const DEFAULT_CERT_DIR: &str = "cer";
@@ -38,7 +39,7 @@ const MIN_FREE_SPACE_PACKAGES_MB: u64 = 2048;
 const MIN_FREE_SPACE_CRYPTO_MB: u64 = 500;
 const MIN_FREE_SPACE_CRITICAL_MB: u64 = 200;
 
-// ==================== ЛОГИРОВАНИЕ В ФАЙЛ (УЛУЧШЕНИЕ №5) ====================
+// ==================== ЛОГИРОВАНИЕ В ФАЙЛ ====================
 
 fn log_file_path() -> String {
     if let Ok(exe) = env::current_exe() {
@@ -83,7 +84,7 @@ fn log_session_start() {
     log_to_file(&format!("Прокси: {}", get_proxy_url()));
 }
 
-// ==================== ПРОВЕРКА ПРАВ ROOT (УЛУЧШЕНИЕ №1) ====================
+// ==================== ПРОВЕРКА ПРАВ ROOT ====================
 
 fn check_root() -> bool {
     let output = Command::new("id").arg("-u").stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -105,7 +106,7 @@ fn require_root_and_exit() -> ! {
     std::process::exit(1);
 }
 
-// ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА (УЛУЧШЕНИЕ №2) ====================
+// ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА ====================
 
 fn get_free_space_mb(path: &str) -> Option<u64> {
     let output = Command::new("df").arg("-BM").arg(path).stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -237,7 +238,7 @@ enum LogEvent {
     Done(bool, String),
 }
 
-// ==================== УТИЛИТЫ И ЦВЕТА (УЛУЧШЕНИЕ №6) ====================
+// ==================== УТИЛИТЫ И ЦВЕТА ====================
 
 fn clean_line(s: &str) -> String {
     let mut out = String::new();
@@ -259,7 +260,6 @@ fn clean_line(s: &str) -> String {
     out.trim().to_string()
 }
 
-// УЛУЧШЕНИЕ №6: Парсинг прогресса dnf
 fn parse_dnf_progress(line: &str) -> Option<(u32, u32, String)> {
     let cleaned = clean_line(line);
     if let Some(start) = cleaned.find('(') {
@@ -300,7 +300,6 @@ fn parse_progress(s: &str) -> Option<(u32, u32)> {
     best
 }
 
-// УЛУЧШЕНИЕ №6: Раскраска строки лога
 fn colorize_log_line(text: &str) -> Line<'static> {
     let t = text.trim();
     let color = if t.is_empty() {
@@ -544,6 +543,138 @@ fn find_packages_by_substring(folder: &str, substring: &str, system_arch: &str) 
     result
 }
 
+// ==================== УЛУЧШЕНИЕ №7: ПОИСК СЕРТИФИКАТА НА USB ====================
+
+/// Ищет файл сертификата на всех смонтированных устройствах
+fn find_cert_on_mounted_devices() -> Option<String> {
+    let search_paths = vec![
+        "/run/media/*/*",
+        "/media/*/*",
+        "/mnt/*",
+    ];
+
+    for pattern in &search_paths {
+        if let Some(path) = search_pattern(pattern) {
+            let cert_path = Path::new(&path).join(CERT_FILE_NAME);
+            if cert_path.exists() {
+                return Some(cert_path.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Ищет первый путь по glob-паттерну
+fn search_pattern(pattern: &str) -> Option<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ls -d {} 2>/dev/null | head -1", pattern))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if path.is_empty() { None } else { Some(path) }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Ищет первое USB-устройство через lsblk
+fn find_first_usb_device() -> Option<String> {
+    let output = Command::new("lsblk")
+        .arg("-dpno")
+        .arg("NAME,TRAN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if line.contains("usb") {
+                    let device = line.split_whitespace().next().unwrap_or("");
+                    if !device.is_empty() {
+                        return Some(device.to_string());
+                    }
+                }
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Монтирует USB-устройство и возвращает точку монтирования
+fn mount_usb_device(device: &str, tx: &mpsc::Sender<LogEvent>) -> Option<String> {
+    let mount_point = "/mnt/usb_cert";
+    let _ = tx.send(LogEvent::Line(format!("   Монтирую {} в {}...", device, mount_point)));
+
+    let _ = Command::new("mkdir").arg("-p").arg(mount_point).status();
+
+    // Пробуем смонтировать первый раздел, затем всё устройство
+    let mount_result = Command::new("mount")
+        .arg(format!("{}1", device))
+        .arg(mount_point)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let success = match mount_result {
+        Ok(s) => s.success(),
+        Err(_) => false,
+    };
+
+    if !success {
+        let _ = Command::new("umount").arg(mount_point).status();
+        let mount_result = Command::new("mount")
+            .arg(device)
+            .arg(mount_point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Ok(s) = mount_result {
+            if !s.success() {
+                let _ = tx.send(LogEvent::Line("   ❌ Не удалось смонтировать устройство".to_string()));
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    // Проверяем, что файл есть
+    let cert_path = Path::new(mount_point).join(CERT_FILE_NAME);
+    if cert_path.exists() {
+        Some(mount_point.to_string())
+    } else {
+        let _ = tx.send(LogEvent::Line(format!("   ❌ Файл {} не найден на флешке", CERT_FILE_NAME)));
+        let _ = Command::new("umount").arg(mount_point).status();
+        None
+    }
+}
+
+/// Размонтирует устройство
+fn unmount_device(mount_point: &str, tx: &mpsc::Sender<LogEvent>) {
+    let _ = tx.send(LogEvent::Line("   Размонтирую флешку...".to_string()));
+    let _ = Command::new("umount").arg(mount_point).status();
+}
+
+/// Проверяет, является ли точка монтирования USB
+fn is_mountpoint(path: &str) -> bool {
+    Command::new("mountpoint")
+        .arg("-q")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 // ==================== ШАГ 1: ПРОКСИ ====================
 
 fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
@@ -596,36 +727,70 @@ fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     (true, "Прокси настроен".to_string())
 }
 
-// ==================== ШАГ 2: СЕРТИФИКАТ ====================
+// ==================== ШАГ 2: СЕРТИФИКАТ (С УЛУЧШЕНИЕМ №7) ====================
 
 fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = tx.send(LogEvent::Line(format!("=== 🔒 Проверка сертификатов из '{}' ===", cert_dir)));
-    if !Path::new(cert_dir).exists() {
-        let _ = tx.send(LogEvent::Line(format!("⚠ Папка '{}' не найдена — пропускаем", cert_dir)));
-        return (true, "Сертификат пропущен (нет папки)".to_string());
-    }
+
+    // Сначала ищем в локальной папке
     let mut certs: Vec<String> = Vec::new();
-    if let Ok(entries) = fs::read_dir(cert_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if name == "README.txt" { continue; }
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if name.starts_with("._") { continue; }
-            if ext != "crt" && ext != "pem" && ext != "cer" { continue; }
-            if !path.is_file() { continue; }
-            if let Ok(meta) = fs::metadata(&path) { if meta.len() < 100 { continue; } }
-            let content = fs::read(&path).unwrap_or_default();
-            let is_pem = content.starts_with(b"-----BEGIN CERTIFICATE-----");
-            let is_der = content.len() > 2 && content[0] == 0x30 && (content[1] == 0x82 || content[1] == 0x81);
-            if !is_pem && !is_der { continue; }
-            certs.push(path.to_string_lossy().to_string());
+    if Path::new(cert_dir).exists() {
+        if let Ok(entries) = fs::read_dir(cert_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if name == "README.txt" { continue; }
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                if name.starts_with("._") { continue; }
+                if ext != "crt" && ext != "pem" && ext != "cer" { continue; }
+                if !path.is_file() { continue; }
+                if let Ok(meta) = fs::metadata(&path) { if meta.len() < 100 { continue; } }
+                let content = fs::read(&path).unwrap_or_default();
+                let is_pem = content.starts_with(b"-----BEGIN CERTIFICATE-----");
+                let is_der = content.len() > 2 && content[0] == 0x30 && (content[1] == 0x82 || content[1] == 0x81);
+                if !is_pem && !is_der { continue; }
+                certs.push(path.to_string_lossy().to_string());
+            }
         }
     }
+
+    // УЛУЧШЕНИЕ №7: Если в локальной папке нет сертификата — ищем на USB
     if certs.is_empty() {
-        let _ = tx.send(LogEvent::Line(format!("⚠ В '{}' нет валидных .crt/.pem — пропускаем", cert_dir)));
+        let _ = tx.send(LogEvent::Line("🔍 Сертификат не найден в папке cer/ — ищу на USB-устройствах...".to_string()));
+        log_to_file("Поиск сертификата на USB-устройствах...");
+
+        // 1. Ищем на уже смонтированных устройствах
+        if let Some(cert_path) = find_cert_on_mounted_devices() {
+            let _ = tx.send(LogEvent::Line(format!("   ✅ Найден на смонтированном устройстве: {}", cert_path)));
+            log_to_file(&format!("Найден сертификат: {}", cert_path));
+            certs.push(cert_path);
+        } else {
+            // 2. Ищем USB-устройства и монтируем
+            let _ = tx.send(LogEvent::Line("   На смонтированных устройствах не найден. Ищу USB...".to_string()));
+            if let Some(device) = find_first_usb_device() {
+                let _ = tx.send(LogEvent::Line(format!("   Найдено USB-устройство: {}", device)));
+                if let Some(mount_point) = mount_usb_device(&device, tx) {
+                    let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
+                    if cert_path.exists() {
+                        let _ = tx.send(LogEvent::Line(format!("   ✅ Найден на флешке: {}", cert_path.display())));
+                        log_to_file(&format!("Найден сертификат на USB: {}", cert_path.display()));
+                        certs.push(cert_path.to_string_lossy().to_string());
+
+                        // Размонтируем после копирования
+                        unmount_device(&mount_point, tx);
+                    }
+                }
+            } else {
+                let _ = tx.send(LogEvent::Line("   ⚠ USB-устройства не найдены. Вставьте флешку с сертификатом.".to_string()));
+            }
+        }
+    }
+
+    if certs.is_empty() {
+        let _ = tx.send(LogEvent::Line(format!("⚠ В '{}' и на USB нет валидных .crt/.pem — пропускаем", cert_dir)));
         return (true, "Сертификат пропущен (нет валидных файлов)".to_string());
     }
+
     let anchors_dir = "/etc/pki/ca-trust/source/anchors";
     let mut all_in_anchors = true;
     let mut all_in_nss = true;
@@ -639,11 +804,13 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         let in_nss = Command::new("sh").arg("-c").arg(&check_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
         if !in_nss { all_in_nss = false; }
     }
+
     if all_in_anchors && all_in_nss {
         let _ = tx.send(LogEvent::Line(format!("✅ Все {} сертификат(ов) уже установлены", certs.len())));
         return (true, "Сертификаты уже установлены".to_string());
     }
-    let _ = tx.send(LogEvent::Line(format!("=== Установка сертификатов из '{}' ===", cert_dir)));
+
+    let _ = tx.send(LogEvent::Line(format!("=== Установка {} сертификат(ов) ===", certs.len())));
     let _ = fs::create_dir_all(anchors_dir);
     for cert in &certs {
         let name = Path::new(cert).file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -657,6 +824,7 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
             let _ = tx.send(LogEvent::Line(format!("   ✅ {} уже на месте", name)));
         }
     }
+
     if command_exists("update-ca-trust") {
         let _ = tx.send(LogEvent::Line("Запускаю update-ca-trust...".to_string()));
         let cmd = Command::new("update-ca-trust");
@@ -666,9 +834,11 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
             Err(e) => return (false, format!("❌ Не удалось запустить update-ca-trust: {}", e)),
         }
     }
+
     let (home, real_user) = real_home_and_user();
     let nssdb_path = format!("{}/.pki/nssdb", home);
     let nssdb = format!("sql:{}", nssdb_path);
+
     if !command_exists("certutil") {
         let mut ok = false;
         for pkg in ["nss-tools", "libnss3-tools"] {
@@ -681,6 +851,7 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
             return (true, "Сертификат в системное хранилище (NSS пропущен)".to_string());
         }
     }
+
     let _ = fs::create_dir_all(&nssdb_path);
     let db_exists = Path::new(&format!("{}/cert9.db", nssdb_path)).exists() || Path::new(&format!("{}/cert8.db", nssdb_path)).exists();
     if !db_exists {
@@ -688,6 +859,7 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         init.arg("-d").arg(&nssdb).arg("-N").arg("--empty-password");
         let _ = init.stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
+
     for cert in &certs {
         let nick = Path::new(cert).file_stem().unwrap_or_default().to_string_lossy().to_string();
         let check_cmd = format!("echo '' | certutil -d '{}' -L 2>/dev/null | grep -q '{}'", nssdb, nick);
@@ -704,12 +876,14 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
             Err(e) => { let _ = tx.send(LogEvent::Line(format!("   ❌ NSS ошибка: {}", e))); }
         }
     }
+
     if let Some(user) = real_user {
         let mut ch = Command::new("chown");
         ch.arg("-R").arg(format!("{}:{}", user, user)).arg(&nssdb_path);
         let _ = ch.status();
         let _ = tx.send(LogEvent::Line(format!("   ✅ chown .pki → {}", user)));
     }
+
     (true, format!("Сертификатов установлено: {}", certs.len()))
 }
 
@@ -1021,6 +1195,31 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
             else { install_from_folder(&download_dir, tx) }
         }
         "install_cryptopro_gia" => install_cryptopro_gia(&crypto_dir, &download_dir, tx),
+        "find_cert" => {
+            // УЛУЧШЕНИЕ №7: Отдельная команда для поиска сертификата
+            let _ = tx.send(LogEvent::Line("🔍 Поиск сертификата ca-root.crt...".to_string()));
+            if let Some(cert_path) = find_cert_on_mounted_devices() {
+                let _ = tx.send(LogEvent::Line(format!("✅ Найден: {}", cert_path)));
+                (true, format!("Сертификат найден: {}", cert_path))
+            } else if let Some(device) = find_first_usb_device() {
+                let _ = tx.send(LogEvent::Line(format!("⚠ На смонтированных не найден. Монтирую {}...", device)));
+                if let Some(mount_point) = mount_usb_device(&device, tx) {
+                    let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
+                    if cert_path.exists() {
+                        let _ = tx.send(LogEvent::Line(format!("✅ Найден на флешке: {}", cert_path.display())));
+                        unmount_device(&mount_point, tx);
+                        (true, format!("Сертификат найден на USB: {}", cert_path.display()))
+                    } else {
+                        unmount_device(&mount_point, tx);
+                        (false, "Сертификат не найден на USB-устройстве".to_string())
+                    }
+                } else {
+                    (false, "Не удалось смонтировать USB-устройство".to_string())
+                }
+            } else {
+                (false, "USB-устройства не найдены. Вставьте флешку с сертификатом.".to_string())
+            }
+        }
         "detect_os" => {
             print_setup_instructions(tx);
             let mut info = format!("🖥 ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
@@ -1056,7 +1255,8 @@ struct CommandItem {
 
 const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
-    CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
+    CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' или с USB в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
+    CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Автоматически ищет ca-root.crt на всех смонтированных устройствах и USB-флешках. УЛУЧШЕНИЕ №7.", icon: "🔍", hotkey: '8' },
     CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Исключает i686 пакеты. Проверяет свободное место (мин. 1 ГБ).", icon: "⬇", hotkey: '3' },
     CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ офлайн. Проверяет свободное место перед установкой.", icon: "⬆", hotkey: '4' },
     CommandItem { id: "download_packages", name: "Скачать пакеты", description: "Скачивает task-koge + r7-office + notepadqq. Проверяет свободное место (мин. 2 ГБ).", icon: "📦", hotkey: '5' },
@@ -1066,7 +1266,7 @@ const COMMANDS: &[CommandItem] = &[
 ];
 
 fn needs_confirmation(cmd_id: &str) -> bool {
-    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia")
+    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia" | "find_cert")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1082,7 +1282,7 @@ struct App {
     arch: String,
     progress: f64,
     progress_label: String,
-    log_lines: Vec<Line<'static>>, // УЛУЧШЕНИЕ №6: храним стилизованные строки
+    log_lines: Vec<Line<'static>>,
     log_rx: Option<mpsc::Receiver<LogEvent>>,
     first_run_shown: bool,
     show_help: bool,
@@ -1120,8 +1320,8 @@ impl App {
     fn select_by_hotkey(&mut self, key: char) {
         if self.is_running || self.pending_command.is_some() { return; }
         match key {
-            '1' => self.selected = 0, '2' => self.selected = 1, '3' => self.selected = 2, '4' => self.selected = 3,
-            '5' => self.selected = 4, '6' => self.selected = 5, '7' => self.selected = 6, '0' => self.selected = 7,
+            '1' => self.selected = 0, '2' => self.selected = 1, '3' => self.selected = 3, '4' => self.selected = 4,
+            '5' => self.selected = 5, '6' => self.selected = 6, '7' => self.selected = 7, '8' => self.selected = 2, '0' => self.selected = 8,
             _ => return,
         }
         self.list_state.select(Some(self.selected));
@@ -1162,7 +1362,6 @@ impl App {
             while let Ok(ev) = receiver.try_recv() {
                 match ev {
                     LogEvent::Line(s) => {
-                        // УЛУЧШЕНИЕ №6: сохраняем раскрашенную строку
                         self.log_lines.push(colorize_log_line(&s));
                         log_to_file(&s);
                         if self.log_lines.len() > 800 { self.log_lines.remove(0); }
@@ -1213,9 +1412,9 @@ fn ui(f: &mut Frame, app: &App) {
         ]))
     }).collect();
 
-    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-7=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
+    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-8=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
                      else if app.pending_command.is_some() { " ⚠️ ОЖИДАНИЕ ПОДТВЕРЖДЕНИЯ: Y=да, N=отмена " }
-                     else { " КОМАНДЫ (1-7: выбор, h: помощь, ↑↓, Enter, q) " };
+                     else { " КОМАНДЫ (1-8: выбор, h: помощь, ↑↓, Enter, q) " };
 
     let commands_list = List::new(items).block(Block::default().title(menu_title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
@@ -1227,9 +1426,11 @@ fn ui(f: &mut Frame, app: &App) {
             Line::from(Span::styled("⌨️  ГОРЯЧИЕ КЛАВИШИ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from("  1 — ℹ Информация и инструкция"), Line::from("  2 — 🌐 Настроить прокси + сертификат"),
+            Line::from("  8 — 🔍 Найти сертификат на USB (NEW!)"),
             Line::from("  3 — ⬇ Скачать обновления системы"), Line::from("  4 — ⬆ Установить обновления"),
             Line::from("  5 — 📦 Скачать пакеты"), Line::from("  6 — 🚀 Установить пакеты"),
-            Line::from("  7 — 🔐 Установить КриптоПро + ГИА"), Line::from("  0 — ✕ Выход"),
+            Line::from("  7 — 🔐 Установить КриптоПро + ГИА"),
+            Line::from("  0 — ✕ Выход"),
             Line::from(""),
             Line::from("  ↑/k — предыдущий пункт"), Line::from("  ↓/j — следующий пункт"),
             Line::from("  Enter — выполнить выбранный пункт"), Line::from("  h — показать/скрыть эту справку"),
@@ -1249,7 +1450,6 @@ fn ui(f: &mut Frame, app: &App) {
         f.render_widget(desc, right_chunks[0]);
     }
 
-    // УЛУЧШЕНИЕ №6: рендерим цветные строки лога
     let height = right_chunks[1].height.saturating_sub(2) as usize;
     let start = app.log_lines.len().saturating_sub(height);
     let visible_lines: Vec<Line> = app.log_lines[start..].to_vec();
@@ -1344,6 +1544,31 @@ fn main() -> io::Result<()> {
                 println!("✅ Папка обновлений: {}", args[2]);
                 return Ok(());
             }
+            "find-cert" => {
+                // УЛУЧШЕНИЕ №7: CLI команда для поиска сертификата
+                println!("🔍 Поиск сертификата {}...", CERT_FILE_NAME);
+                if let Some(cert_path) = find_cert_on_mounted_devices() {
+                    println!("✅ Найден на смонтированном устройстве: {}", cert_path);
+                } else if let Some(device) = find_first_usb_device() {
+                    println!("⚠ На смонтированных не найден. Монтирую {}...", device);
+                    let (tx, rx) = mpsc::channel::<LogEvent>();
+                    if let Some(mount_point) = mount_usb_device(&device, &tx) {
+                        let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
+                        if cert_path.exists() {
+                            println!("✅ Найден на флешке: {}", cert_path.display());
+                            unmount_device(&mount_point, &tx);
+                        } else {
+                            println!("❌ Файл не найден на флешке");
+                            unmount_device(&mount_point, &tx);
+                        }
+                    } else {
+                        println!("❌ Не удалось смонтировать USB");
+                    }
+                } else {
+                    println!("❌ USB-устройства не найдены");
+                }
+                return Ok(());
+            }
             "show-settings" => {
                 println!("=== Текущие настройки ===\n");
                 println!("Файл: {}", SETTINGS_FILE);
@@ -1372,6 +1597,7 @@ fn main() -> io::Result<()> {
         let cmd_id = match mode {
             "setup-env" => "setup_env", "download-updates" => "download_updates", "install-updates" => "install_updates",
             "download-packages" => "download_packages", "install-packages" => "install_packages", "install-crypto-gia" => "install_cryptopro_gia",
+            "find-cert" => "find_cert",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
         thread::spawn(move || run_command(&cmd_id, &tx));
@@ -1427,7 +1653,7 @@ fn main() -> io::Result<()> {
                 if let KeyCode::Char(c) = key.code {
                     if !app.is_running {
                         match c {
-                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '0' => { app.select_by_hotkey(c); if c == '0' { break; } continue; }
+                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '0' => { app.select_by_hotkey(c); if c == '0' { break; } continue; }
                             'h' | 'H' | 'р' | 'Р' => { app.toggle_help(); continue; }
                             _ => {}
                         }
