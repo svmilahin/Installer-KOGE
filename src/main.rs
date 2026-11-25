@@ -14,7 +14,7 @@ use ratatui::{
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -24,18 +24,74 @@ use std::time::Duration;
 // ==================== НАСТРОЙКИ ====================
 
 const SETTINGS_FILE: &str = "school-installer.conf";
+const LOG_FILE: &str = "school-installer.log";
+const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 МБ — после этого ротация
+
 const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
 const DEFAULT_CERT_DIR: &str = "cer";
 const DEFAULT_CRYPTO_DIR: &str = "cryptopro_gia";
 const DEFAULT_SCHOOL_PACKAGES_DIR: &str = "school_packages";
 const DEFAULT_UPDATES_DIR: &str = "updates";
 
-// ==================== ПОРОГИ СВОБОДНОГО МЕСТА (МБ) ====================
-
 const MIN_FREE_SPACE_UPDATES_MB: u64 = 1024;
 const MIN_FREE_SPACE_PACKAGES_MB: u64 = 2048;
 const MIN_FREE_SPACE_CRYPTO_MB: u64 = 500;
 const MIN_FREE_SPACE_CRITICAL_MB: u64 = 200;
+
+// ==================== ЛОГИРОВАНИЕ В ФАЙЛ (УЛУЧШЕНИЕ №5) ====================
+
+/// Получает путь к файлу лога (рядом с бинарником)
+fn log_file_path() -> String {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.join(LOG_FILE).to_string_lossy().to_string();
+        }
+    }
+    LOG_FILE.to_string()
+}
+
+/// Проверяет размер лога и делает ротацию если нужно
+fn rotate_log_if_needed() {
+    let path = log_file_path();
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > MAX_LOG_SIZE_BYTES {
+            let timestamp = chrono_now_approx();
+            let rotated = format!("{}.{}", path, timestamp);
+            let _ = fs::rename(&path, &rotated);
+        }
+    }
+}
+
+/// Простая метка времени без внешних зависимостей (YYYYMMDD-HHMMSS)
+fn chrono_now_approx() -> String {
+    // Используем команду date, т.к. chrono — лишняя зависимость
+    if let Ok(out) = Command::new("date").arg("+%Y%m%d-%H%M%S").output() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Пишет строку в лог-файл
+fn log_to_file(msg: &str) {
+    rotate_log_if_needed();
+    let path = log_file_path();
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let timestamp = chrono_now_approx();
+        let _ = writeln!(file, "[{}] {}", timestamp, msg);
+    }
+}
+
+/// Записывает стартовый маркер в лог
+fn log_session_start() {
+    log_to_file("=== Новая сессия school-installer ===");
+    log_to_file(&format!("ОС: МОС ОС | Архитектура: {}", detect_arch()));
+    log_to_file(&format!("Прокси: {}", get_proxy_url()));
+}
 
 // ==================== ПРОВЕРКА ПРАВ ROOT (УЛУЧШЕНИЕ №1) ====================
 
@@ -45,12 +101,8 @@ fn check_root() -> bool {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
-
     match output {
-        Ok(out) => {
-            let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            uid == "0"
-        }
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim() == "0",
         Err(_) => false,
     }
 }
@@ -76,7 +128,6 @@ fn get_free_space_mb(path: &str) -> Option<u64> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
-
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -114,7 +165,6 @@ fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) ->
         }
         p.to_string_lossy().to_string()
     };
-
     match get_free_space_mb(&check_path) {
         Some(free_mb) => {
             if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
@@ -131,26 +181,18 @@ fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) ->
             }
             (true, format!("✅ Свободно {} на {} (требуется {})", format_size_mb(free_mb), check_path, format_size_mb(min_mb)))
         }
-        None => {
-            (true, format!("⚠ Не удалось определить свободное место на {}. Продолжаем с осторожностью.", check_path))
-        }
+        None => (true, format!("⚠ Не удалось определить свободное место на {}. Продолжаем с осторожностью.", check_path)),
     }
 }
 
 fn estimate_dnf_download_size(args: &[&str]) -> Option<u64> {
     let mut cmd = Command::new("dnf");
-    for arg in args {
-        cmd.arg(arg);
-    }
+    for arg in args { cmd.arg(arg); }
     cmd.arg("--assumeno");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-
     let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
-
+    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     for line in combined.lines() {
         let lower = line.to_lowercase();
         if lower.contains("download size") || lower.contains("объем загрузки") || lower.contains("total size") {
@@ -251,7 +293,30 @@ fn clean_line(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    out.trim().to_string()
+}
+
+// УЛУЧШЕНИЕ №5: парсинг прогресса dnf вида "(N/M): package.rpm  1.2 MB/s | 500 kB  00:00"
+fn parse_dnf_progress(line: &str) -> Option<(u32, u32, String)> {
+    let cleaned = clean_line(line);
+    // Ищем паттерн "(N/M):"
+    if let Some(start) = cleaned.find('(') {
+        if let Some(slash) = cleaned[start..].find('/') {
+            if let Some(end) = cleaned[start..].find(')') {
+                let n_str = &cleaned[start+1..start+slash];
+                let m_str = &cleaned[start+slash+1..start+end];
+                if let (Ok(n), Ok(m)) = (n_str.trim().parse::<u32>(), m_str.trim().parse::<u32>()) {
+                    if m > 0 && n <= m {
+                        // Берём имя пакета после ": "
+                        let rest = &cleaned[start+end+1..];
+                        let pkg_name = rest.trim().split_whitespace().next().unwrap_or("").to_string();
+                        return Some((n, m, pkg_name));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn parse_progress(s: &str) -> Option<(u32, u32)> {
@@ -277,6 +342,7 @@ fn parse_progress(s: &str) -> Option<(u32, u32)> {
     best
 }
 
+// УЛУЧШЕНИЕ №5: запуск процесса с улучшенным парсингом вывода dnf
 fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<ExitStatus> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -288,12 +354,23 @@ fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<Exit
         for line in reader.lines() {
             if let Ok(l) = line {
                 let cleaned = clean_line(&l);
-                if !cleaned.trim().is_empty() {
+                if cleaned.is_empty() { continue; }
+
+                // УЛУЧШЕНИЕ №5: парсим прогресс dnf
+                if let Some((n, m, pkg)) = parse_dnf_progress(&l) {
+                    let pct = n as f64 / m as f64;
+                    let msg = if pkg.is_empty() {
+                        format!("Скачивание: {} / {}", n, m)
+                    } else {
+                        format!("Скачивание: {} / {} — {}", n, m, pkg)
+                    };
+                    let _ = tx_err.send(LogEvent::Progress(pct, msg));
+                    // Также логируем в файл
+                    log_to_file(&format!("[PROGRESS] {}/{} {}", n, m, pkg));
+                } else {
+                    // Обычная строка — логируем
                     let _ = tx_err.send(LogEvent::Line(cleaned.clone()));
-                }
-                if let Some((done, total)) = parse_progress(&l) {
-                    let pct = done as f64 / total as f64;
-                    let _ = tx_err.send(LogEvent::Progress(pct, format!("{} / {}", done, total)));
+                    log_to_file(&cleaned);
                 }
             }
         }
@@ -304,9 +381,9 @@ fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<Exit
     for line in reader.lines() {
         if let Ok(l) = line {
             let cleaned = clean_line(&l);
-            if !cleaned.trim().is_empty() {
-                let _ = tx.send(LogEvent::Line(cleaned));
-            }
+            if cleaned.is_empty() { continue; }
+            let _ = tx.send(LogEvent::Line(cleaned.clone()));
+            log_to_file(&cleaned);
         }
     }
 
@@ -792,10 +869,9 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
         let _ = tx.send(LogEvent::Line(format!("📊 Примерный размер скачивания: {}", format_size_mb(size_mb))));
         if size_mb > 0 {
             let (enough, msg) = check_free_space(download_dir, size_mb + 100, "Скачивание обновлений (с запасом 100 МБ)");
+            let _ = tx.send(LogEvent::Line(msg));
             if !enough {
-                let _ = tx.send(LogEvent::Line(msg));
-            } else {
-                let _ = tx.send(LogEvent::Line(msg));
+                return (false, format!("❌ Недостаточно места. Освободите {} и повторите.", format_size_mb(size_mb + 100)));
             }
         }
     }
@@ -1086,6 +1162,8 @@ fn get_packages() -> Vec<&'static str> {
 // ==================== ДИСПЕТЧЕР КОМАНД ====================
 
 fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
+    log_to_file(&format!("=== Запуск команды: {} ===", cmd_id));
+
     let pkg_dir = get_school_packages_dir();
     let upd_dir = get_updates_dir();
     if pkg_dir == upd_dir {
@@ -1144,12 +1222,14 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
             if let Some(free_mb) = get_free_space_mb(&download_dir) {
                 info += &format!("\n  💾 Свободно на диске: {}", format_size_mb(free_mb));
             }
+            info += &format!("\n\n  📝 Лог сохраняется в: {}", log_file_path());
             (true, info)
         }
         "exit" => (true, "Выход".to_string()),
         _ => (false, "Неизвестная команда".to_string()),
     };
     let _ = tx.send(LogEvent::Done(result.0, result.1));
+    log_to_file(&format!("=== Команда {} завершена: {} ===", cmd_id, if result.0 { "УСПЕХ" } else { "ОШИБКА" }));
 }
 
 // ==================== TUI ====================
@@ -1174,7 +1254,6 @@ const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕", hotkey: '0' },
 ];
 
-// УЛУЧШЕНИЕ №4: Список команд, требующих подтверждения
 fn needs_confirmation(cmd_id: &str) -> bool {
     matches!(cmd_id,
         "setup_env" | "download_updates" | "install_updates" |
@@ -1182,7 +1261,6 @@ fn needs_confirmation(cmd_id: &str) -> bool {
     )
 }
 
-// УЛУЧШЕНИЕ №4: Вспомогательная функция для центрирования модального окна
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1214,7 +1292,7 @@ struct App {
     log_rx: Option<mpsc::Receiver<LogEvent>>,
     first_run_shown: bool,
     show_help: bool,
-    pending_command: Option<usize>, // УЛУЧШЕНИЕ №4: индекс команды, ожидающей подтверждения
+    pending_command: Option<usize>,
 }
 
 impl App {
@@ -1266,7 +1344,6 @@ impl App {
         let cmd_idx = self.selected;
         let cmd = COMMANDS[cmd_idx].clone();
         
-        // УЛУЧШЕНИЕ №4: если команда деструктивная — запрашиваем подтверждение
         if needs_confirmation(cmd.id) {
             self.pending_command = Some(cmd_idx);
             self.status = format!("⚠️ Требуется подтверждение: {}", cmd.name);
@@ -1275,7 +1352,6 @@ impl App {
         }
     }
 
-    // УЛУЧШЕНИЕ №4: запуск команды (без проверки подтверждения)
     fn start_command(&mut self, idx: usize) {
         let cmd = COMMANDS[idx].clone();
         self.is_running = true;
@@ -1301,15 +1377,21 @@ impl App {
             while let Ok(ev) = receiver.try_recv() {
                 match ev {
                     LogEvent::Line(s) => {
-                        self.log_lines.push(s);
+                        self.log_lines.push(s.clone());
+                        log_to_file(&s);  // УЛУЧШЕНИЕ №5: дублируем в файл
                         if self.log_lines.len() > 800 { self.log_lines.remove(0); }
                     }
-                    LogEvent::Progress(p, label) => { self.progress = p; self.progress_label = label; }
+                    LogEvent::Progress(p, label) => {
+                        self.progress = p;
+                        self.progress_label = label.clone();
+                        log_to_file(&format!("[PROGRESS] {} {}", p, label));
+                    }
                     LogEvent::Done(ok, msg) => {
                         self.progress = 1.0;
                         self.progress_label = String::new();
                         self.status = if ok { format!("✅ {}", msg) } else { format!("❌ {}", msg) };
                         self.is_running = false;
+                        log_to_file(&format!("=== ЗАВЕРШЕНО: {} ===", msg));
                         rx = None;
                         break;
                     }
@@ -1435,7 +1517,7 @@ fn ui(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(progress_bar, chunks[2]);
 
-    let status_color = if app.status.starts_with("✅") { Color::Green } else if app.status.starts_with("❌") { Color::Red } else if app.status.starts_with("▶") { Color::Yellow } else if app.status.starts_with("⚠️") { Color::Yellow } else { Color::White };
+    let status_color = if app.status.starts_with("✅") { Color::Green } else if app.status.starts_with("❌") { Color::Red } else if app.status.starts_with("▶") { Color::Yellow } else if app.status.starts_with("⚠") { Color::Yellow } else { Color::White };
     let status_widget = Paragraph::new(vec![Line::from(vec![
         Span::styled(" Статус: ", Style::default().fg(Color::Cyan)),
         Span::styled(app.status.as_str(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
@@ -1443,7 +1525,6 @@ fn ui(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(status_widget, chunks[3]);
 
-    // УЛУЧШЕНИЕ №4: Рендер модального окна подтверждения
     if let Some(idx) = app.pending_command {
         let area = centered_rect(60, 30, f.area());
         f.render_widget(Clear, area);
@@ -1488,10 +1569,12 @@ fn ui(f: &mut Frame, app: &App) {
 // ==================== ТОЧКА ВХОДА ====================
 
 fn main() -> io::Result<()> {
-    // 🔒 УЛУЧШЕНИЕ №1: Проверка прав root — самое первое, что делаем
     if !check_root() {
         require_root_and_exit();
     }
+
+    // УЛУЧШЕНИЕ №5: инициализация логирования
+    log_session_start();
 
     let args: Vec<String> = env::args().collect();
 
@@ -1502,6 +1585,7 @@ fn main() -> io::Result<()> {
                 if args.len() < 3 { println!("Использование: --set-proxy <URL>"); return Ok(()); }
                 save_setting("PROXY_URL", &args[2])?;
                 println!("✅ Прокси установлен: {}", args[2]);
+                log_to_file(&format!("CLI: set-proxy {}", args[2]));
                 return Ok(());
             }
             "set-cert-dir" => {
@@ -1539,6 +1623,7 @@ fn main() -> io::Result<()> {
                 if let Some(free_mb) = get_free_space_mb(".") {
                     println!("💾 Свободно на диске: {}", format_size_mb(free_mb));
                 }
+                println!("\n📝 Лог: {}", log_file_path());
                 return Ok(());
             }
             "reset-settings" => {
@@ -1566,10 +1651,17 @@ fn main() -> io::Result<()> {
         thread::spawn(move || run_command(&cmd_id, &tx));
         loop {
             match rx.recv() {
-                Ok(LogEvent::Line(s)) => println!("{}", s),
-                Ok(LogEvent::Progress(p, l)) => println!("[{:>3.0}%] {}", p * 100.0, l),
+                Ok(LogEvent::Line(s)) => {
+                    println!("{}", s);
+                    log_to_file(&s);
+                }
+                Ok(LogEvent::Progress(p, l)) => {
+                    println!("[{:>3.0}%] {}", p * 100.0, l);
+                    log_to_file(&format!("[PROGRESS] {} {}", p, l));
+                }
                 Ok(LogEvent::Done(ok, msg)) => {
                     println!("{}", msg);
+                    log_to_file(&format!("=== ЗАВЕРШЕНО: {} ===", msg));
                     if !ok { std::process::exit(1); }
                     break;
                 }
@@ -1602,7 +1694,6 @@ fn main() -> io::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { break; }
 
-                // УЛУЧШЕНИЕ №4: Обработка подтверждения
                 if let Some(pending_idx) = app.pending_command {
                     if let KeyCode::Char(c) = key.code {
                         match c {
@@ -1620,10 +1711,9 @@ fn main() -> io::Result<()> {
                         app.pending_command = None;
                         app.status = "❌ Отменено пользователем".to_string();
                     }
-                    continue; // Не обрабатываем другие клавиши пока висит подтверждение
+                    continue;
                 }
 
-                // УЛУЧШЕНИЕ №3: обработка горячих клавиш 0-9
                 if let KeyCode::Char(c) = key.code {
                     if !app.is_running {
                         match c {
@@ -1657,5 +1747,6 @@ fn main() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
+    log_to_file("=== Сессия завершена ===");
     Ok(())
 }
