@@ -25,7 +25,7 @@ use std::time::Duration;
 
 const SETTINGS_FILE: &str = "school-installer.conf";
 const LOG_FILE: &str = "school-installer.log";
-const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 МБ — после этого ротация
+const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 МБ
 
 const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
 const DEFAULT_CERT_DIR: &str = "cer";
@@ -40,7 +40,6 @@ const MIN_FREE_SPACE_CRITICAL_MB: u64 = 200;
 
 // ==================== ЛОГИРОВАНИЕ В ФАЙЛ (УЛУЧШЕНИЕ №5) ====================
 
-/// Получает путь к файлу лога (рядом с бинарником)
 fn log_file_path() -> String {
     if let Ok(exe) = env::current_exe() {
         if let Some(parent) = exe.parent() {
@@ -50,7 +49,6 @@ fn log_file_path() -> String {
     LOG_FILE.to_string()
 }
 
-/// Проверяет размер лога и делает ротацию если нужно
 fn rotate_log_if_needed() {
     let path = log_file_path();
     if let Ok(meta) = fs::metadata(&path) {
@@ -62,9 +60,7 @@ fn rotate_log_if_needed() {
     }
 }
 
-/// Простая метка времени без внешних зависимостей (YYYYMMDD-HHMMSS)
 fn chrono_now_approx() -> String {
-    // Используем команду date, т.к. chrono — лишняя зависимость
     if let Ok(out) = Command::new("date").arg("+%Y%m%d-%H%M%S").output() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     } else {
@@ -72,21 +68,15 @@ fn chrono_now_approx() -> String {
     }
 }
 
-/// Пишет строку в лог-файл
 fn log_to_file(msg: &str) {
     rotate_log_if_needed();
     let path = log_file_path();
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let timestamp = chrono_now_approx();
         let _ = writeln!(file, "[{}] {}", timestamp, msg);
     }
 }
 
-/// Записывает стартовый маркер в лог
 fn log_session_start() {
     log_to_file("=== Новая сессия school-installer ===");
     log_to_file(&format!("ОС: МОС ОС | Архитектура: {}", detect_arch()));
@@ -96,11 +86,7 @@ fn log_session_start() {
 // ==================== ПРОВЕРКА ПРАВ ROOT (УЛУЧШЕНИЕ №1) ====================
 
 fn check_root() -> bool {
-    let output = Command::new("id")
-        .arg("-u")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+    let output = Command::new("id").arg("-u").stdout(Stdio::piped()).stderr(Stdio::null()).output();
     match output {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim() == "0",
         Err(_) => false,
@@ -122,12 +108,7 @@ fn require_root_and_exit() -> ! {
 // ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА (УЛУЧШЕНИЕ №2) ====================
 
 fn get_free_space_mb(path: &str) -> Option<u64> {
-    let output = Command::new("df")
-        .arg("-BM")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+    let output = Command::new("df").arg("-BM").arg(path).stdout(Stdio::piped()).stderr(Stdio::null()).output();
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -147,11 +128,7 @@ fn get_free_space_mb(path: &str) -> Option<u64> {
 }
 
 fn format_size_mb(mb: u64) -> String {
-    if mb >= 1024 {
-        format!("{:.1} ГБ", mb as f64 / 1024.0)
-    } else {
-        format!("{} МБ", mb)
-    }
+    if mb >= 1024 { format!("{:.1} ГБ", mb as f64 / 1024.0) } else { format!("{} МБ", mb) }
 }
 
 fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) -> (bool, String) {
@@ -160,24 +137,16 @@ fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) ->
         path.to_string()
     } else {
         let mut p = Path::new(path);
-        while !p.exists() && p.parent().is_some() {
-            p = p.parent().unwrap();
-        }
+        while !p.exists() && p.parent().is_some() { p = p.parent().unwrap(); }
         p.to_string_lossy().to_string()
     };
     match get_free_space_mb(&check_path) {
         Some(free_mb) => {
             if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
-                return (false, format!(
-                    "❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {} на {}. {} требует минимум {}. Освободите место!",
-                    format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)
-                ));
+                return (false, format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {} на {}. {} требует минимум {}. Освободите место!", format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)));
             }
             if free_mb < min_mb {
-                return (false, format!(
-                    "⚠ Недостаточно места: свободно {} на {}. {} требует минимум {}. Освободите место или выберите другой диск.",
-                    format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)
-                ));
+                return (false, format!("⚠ Недостаточно места: свободно {} на {}. {} требует минимум {}. Освободите место или выберите другой диск.", format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)));
             }
             (true, format!("✅ Свободно {} на {} (требуется {})", format_size_mb(free_mb), check_path, format_size_mb(min_mb)))
         }
@@ -188,9 +157,7 @@ fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) ->
 fn estimate_dnf_download_size(args: &[&str]) -> Option<u64> {
     let mut cmd = Command::new("dnf");
     for arg in args { cmd.arg(arg); }
-    cmd.arg("--assumeno");
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.arg("--assumeno").stdout(Stdio::piped()).stderr(Stdio::piped());
     let output = cmd.output().ok()?;
     let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     for line in combined.lines() {
@@ -200,9 +167,7 @@ fn estimate_dnf_download_size(args: &[&str]) -> Option<u64> {
                 let before = &line[..pos];
                 let parts: Vec<&str> = before.split_whitespace().collect();
                 if let Some(last) = parts.last() {
-                    if let Ok(size) = last.parse::<u64>() {
-                        return Some(size);
-                    }
+                    if let Ok(size) = last.parse::<u64>() { return Some(size); }
                 }
             }
         }
@@ -240,9 +205,7 @@ fn save_setting(key: &str, value: &str) -> io::Result<()> {
 
 fn get_setting(key: &str, default: &str) -> String {
     let env_key = format!("SCHOOL_{}", key);
-    if let Ok(val) = env::var(&env_key) {
-        if !val.is_empty() { return val; }
-    }
+    if let Ok(val) = env::var(&env_key) { if !val.is_empty() { return val; } }
     let settings = load_settings();
     if let Some(val) = settings.get(key) { return val.clone(); }
     default.to_string()
@@ -274,7 +237,7 @@ enum LogEvent {
     Done(bool, String),
 }
 
-// ==================== УТИЛИТЫ ====================
+// ==================== УТИЛИТЫ И ЦВЕТА (УЛУЧШЕНИЕ №6) ====================
 
 fn clean_line(s: &str) -> String {
     let mut out = String::new();
@@ -296,10 +259,9 @@ fn clean_line(s: &str) -> String {
     out.trim().to_string()
 }
 
-// УЛУЧШЕНИЕ №5: парсинг прогресса dnf вида "(N/M): package.rpm  1.2 MB/s | 500 kB  00:00"
+// УЛУЧШЕНИЕ №6: Парсинг прогресса dnf
 fn parse_dnf_progress(line: &str) -> Option<(u32, u32, String)> {
     let cleaned = clean_line(line);
-    // Ищем паттерн "(N/M):"
     if let Some(start) = cleaned.find('(') {
         if let Some(slash) = cleaned[start..].find('/') {
             if let Some(end) = cleaned[start..].find(')') {
@@ -307,7 +269,6 @@ fn parse_dnf_progress(line: &str) -> Option<(u32, u32, String)> {
                 let m_str = &cleaned[start+slash+1..start+end];
                 if let (Ok(n), Ok(m)) = (n_str.trim().parse::<u32>(), m_str.trim().parse::<u32>()) {
                     if m > 0 && n <= m {
-                        // Берём имя пакета после ": "
                         let rest = &cleaned[start+end+1..];
                         let pkg_name = rest.trim().split_whitespace().next().unwrap_or("").to_string();
                         return Some((n, m, pkg_name));
@@ -325,10 +286,7 @@ fn parse_progress(s: &str) -> Option<(u32, u32)> {
         if let Some(end) = chunk.find(']') {
             let inner = &chunk[..end];
             if let Some(slash) = inner.find('/') {
-                if let (Ok(a), Ok(b)) = (
-                    inner[..slash].trim().parse::<u32>(),
-                    inner[slash + 1..].trim().parse::<u32>(),
-                ) {
+                if let (Ok(a), Ok(b)) = (inner[..slash].trim().parse::<u32>(), inner[slash + 1..].trim().parse::<u32>()) {
                     if b > 0 && a <= b {
                         best = match best {
                             None => Some((a, b)),
@@ -342,7 +300,29 @@ fn parse_progress(s: &str) -> Option<(u32, u32)> {
     best
 }
 
-// УЛУЧШЕНИЕ №5: запуск процесса с улучшенным парсингом вывода dnf
+// УЛУЧШЕНИЕ №6: Раскраска строки лога
+fn colorize_log_line(text: &str) -> Line<'static> {
+    let t = text.trim();
+    let color = if t.is_empty() {
+        Color::White
+    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") {
+        Color::Green
+    } else if t.starts_with("❌") || t.starts_with("[X]") || t.contains("Ошибка") || t.contains("не удалось") || t.contains("не найден") {
+        Color::Red
+    } else if t.starts_with("⚠") || t.starts_with("[!]") || t.contains("ВНИМАНИЕ") || t.contains("пропускаем") {
+        Color::Yellow
+    } else if t.starts_with("📊") || t.starts_with("📥") || t.starts_with("💾") || t.starts_with("🔒") || t.starts_with("🌐") || t.starts_with("🔐") || t.starts_with("📦") || t.starts_with("🚀") || t.starts_with("🔑") {
+        Color::Cyan
+    } else if t.starts_with("===") {
+        Color::Magenta
+    } else if t.starts_with("   ") && (t.contains("->") || t.contains("✅")) {
+        if t.contains("✅") { Color::Green } else { Color::Gray }
+    } else {
+        Color::White
+    };
+    Line::from(Span::styled(text.to_string(), Style::default().fg(color)))
+}
+
 fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<ExitStatus> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -355,20 +335,12 @@ fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<Exit
             if let Ok(l) = line {
                 let cleaned = clean_line(&l);
                 if cleaned.is_empty() { continue; }
-
-                // УЛУЧШЕНИЕ №5: парсим прогресс dnf
                 if let Some((n, m, pkg)) = parse_dnf_progress(&l) {
                     let pct = n as f64 / m as f64;
-                    let msg = if pkg.is_empty() {
-                        format!("Скачивание: {} / {}", n, m)
-                    } else {
-                        format!("Скачивание: {} / {} — {}", n, m, pkg)
-                    };
+                    let msg = if pkg.is_empty() { format!("Скачивание: {} / {}", n, m) } else { format!("Скачивание: {} / {} — {}", n, m, pkg) };
                     let _ = tx_err.send(LogEvent::Progress(pct, msg));
-                    // Также логируем в файл
                     log_to_file(&format!("[PROGRESS] {}/{} {}", n, m, pkg));
                 } else {
-                    // Обычная строка — логируем
                     let _ = tx_err.send(LogEvent::Line(cleaned.clone()));
                     log_to_file(&cleaned);
                 }
@@ -393,24 +365,13 @@ fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<Exit
 }
 
 fn command_exists(name: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {}", name))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    Command::new("sh").arg("-c").arg(format!("command -v {}", name)).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }
 
 // ==================== ОПРЕДЕЛЕНИЕ СИСТЕМЫ ====================
 
 fn detect_arch() -> String {
-    Command::new("uname")
-        .arg("-m")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase().to_string())
-        .unwrap_or_else(|_| "x86_64".to_string())
+    Command::new("uname").arg("-m").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase().to_string()).unwrap_or_else(|_| "x86_64".to_string())
 }
 
 fn real_home_and_user() -> (String, Option<String>) {
@@ -420,16 +381,13 @@ fn real_home_and_user() -> (String, Option<String>) {
                 let s = String::from_utf8_lossy(&out.stdout);
                 if let Some(line) = s.lines().next() {
                     let parts: Vec<&str> = line.split(':').collect();
-                    if parts.len() >= 6 && !parts[5].is_empty() {
-                        return (parts[5].to_string(), Some(user));
-                    }
+                    if parts.len() >= 6 && !parts[5].is_empty() { return (parts[5].to_string(), Some(user)); }
                 }
             }
             return (format!("/home/{}", user), Some(user));
         }
     }
-    let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    (home, None)
+    (env::var("HOME").unwrap_or_else(|_| "/root".to_string()), None)
 }
 
 fn get_folder_size(path: &str) -> u64 {
@@ -437,11 +395,8 @@ fn get_folder_size(path: &str) -> u64 {
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.is_file() {
-                if let Ok(meta) = fs::metadata(&p) { total += meta.len(); }
-            } else if p.is_dir() {
-                total += get_folder_size(&p.to_string_lossy());
-            }
+            if p.is_file() { if let Ok(meta) = fs::metadata(&p) { total += meta.len(); } }
+            else if p.is_dir() { total += get_folder_size(&p.to_string_lossy()); }
         }
     }
     total
@@ -467,85 +422,11 @@ fn ensure_directories() {
     let cert_dir = get_cert_dir();
 
     let dirs_with_readme: Vec<(String, &str)> = vec![
-        (base_packages.clone(),
-            "📦 ПАКЕТЫ ДЛЯ МОС ОС (ROSA)\n\
-             ========================================\n\
-             Сюда автоматически скачиваются пакеты для установки.\n\
-             \n\
-             Основные пакеты:\n\
-             - task-koge-*.rpm        (метапакет для ОГЭ/ЕГЭ по информатике)\n\
-             - r7-office-*.rpm        (или myoffice-education-*.rpm)\n\
-             - notepadqq-*.rpm        (редактор кода)\n\
-             \n\
-             Как получить:\n\
-             1. Запустите на машине с МОС ОС и интернетом:\n\
-                sudo ./school-installer --download-packages\n\
-             2. Пакеты автоматически скачаются в эту папку\n\
-             3. Скопируйте папку school_packages/ на флешку"),
-        (base_updates.clone(),
-            "🔄 ОБНОВЛЕНИЯ ДЛЯ МОС ОС (ROSA)\n\
-             ========================================\n\
-             Сюда автоматически скачиваются обновления системы.\n\
-             \n\
-             Как получить:\n\
-             sudo ./school-installer --download-updates\n\
-             \n\
-             Установка в классе:\n\
-             sudo ./school-installer --install-updates"),
-        (format!("{}/linux-amd64", crypto_dir),
-            "🔐 КРИПТОПРО CSP — ДИСТРИБУТИВ\n\
-             ========================================\n\
-             Сюда положите дистрибутив КриптоПро CSP.\n\
-             \n\
-             Что сюда положить:\n\
-             1. Распакуйте архив КриптоПро CSP (например, linux-amd64.tgz)\n\
-             2. Скопируйте ВСЕ файлы из распакованной папки сюда:\n\
-                - install.sh              (ОБЯЗАТЕЛЬНО)\n\
-                - uninstall.sh            (ОБЯЗАТЕЛЬНО)\n\
-                - lsb-cprocsp-base-*.rpm\n\
-                - lsb-cprocsp-rdr-*.rpm\n\
-                - lsb-cprocsp-kc1-*.rpm   (или kc2, если нужен)\n\
-                - lsb-cprocsp-capilite-*.rpm\n\
-                - cprocsp-curl-*.rpm\n\
-                - lsb-cprocsp-ca-certs-*.rpm\n\
-             \n\
-             ВАЖНО: install.sh сам выберет правильный менеджер пакетов.\n\
-             \n\
-             Конфигурация: kc1 (по умолчанию) — для экзаменов.\n\
-             kc2 используйте только если точно знаете, зачем."),
-        (crypto_dir.clone(),
-            "🔑 КРИПТОПРО + ГИА — ДОПОЛНИТЕЛЬНЫЕ ПАКЕТЫ\n\
-             ========================================\n\
-             Корень папки cryptopro_gia/ — сюда кладите:\n\
-             \n\
-             1. newt-*.rpm\n\
-                — нужен для install.sh КриптоПро\n\
-             \n\
-             2. pcsc-lite-*.rpm и pcsc-lite-ccid-*.rpm\n\
-                — демон смарт-карт и драйвер USB-ридеров\n\
-             \n\
-             3. librtpkcs11ecp-*.rpm\n\
-                — библиотека для токенов Рутокен/Jacarta\n\
-             \n\
-             4. GIA11_PPE-*.rpm\n\
-                — платформа проведения экзамена (ОБЯЗАТЕЛЬНО)\n\
-             \n\
-             Если какого-то пакета нет — программа скачает его\n\
-             из репозитория (нужен интернет через прокси)."),
-        (cert_dir,
-            "🔒 СЕРТИФИКАТЫ\n\
-             ========================================\n\
-             Сюда положите корневые сертификаты (.crt, .pem, .cer)\n\
-             для прокси и внутренних сайтов школы.\n\
-             \n\
-             Обычно это файл ca-root.crt от вашего прокси-сервера.\n\
-             \n\
-             Программа установит сертификаты:\n\
-             1. В системное хранилище (update-ca-trust)\n\
-             2. В NSS-базу Chromium (для браузера)\n\
-             \n\
-             ВАЖНО: не кладите файлы, начинающиеся с ._ (это\n\
-             macOS-артефакты, они не являются сертификатами)."),
+        (base_packages.clone(), "📦 ПАКЕТЫ ДЛЯ МОС ОС (ROSA)\n========================================\nСюда автоматически скачиваются пакеты для установки.\n\nОсновные пакеты:\n- task-koge-*.rpm        (метапакет для ОГЭ/ЕГЭ по информатике)\n- r7-office-*.rpm        (или myoffice-education-*.rpm)\n- notepadqq-*.rpm        (редактор кода)\n\nКак получить:\n1. Запустите на машине с МОС ОС и интернетом:\n   sudo ./school-installer --download-packages\n2. Пакеты автоматически скачаются в эту папку\n3. Скопируйте папку school_packages/ на флешку"),
+        (base_updates.clone(), "🔄 ОБНОВЛЕНИЯ ДЛЯ МОС ОС (ROSA)\n========================================\nСюда автоматически скачиваются обновления системы.\n\nКак получить:\nsudo ./school-installer --download-updates\n\nУстановка в классе:\nsudo ./school-installer --install-updates"),
+        (format!("{}/linux-amd64", crypto_dir), "🔐 КРИПТОПРО CSP — ДИСТРИБУТИВ\n========================================\nСюда положите дистрибутив КриптоПро CSP.\n\nЧто сюда положить:\n1. Распакуйте архив КриптоПро CSP (например, linux-amd64.tgz)\n2. Скопируйте ВСЕ файлы из распакованной папки сюда:\n   - install.sh              (ОБЯЗАТЕЛЬНО)\n   - uninstall.sh            (ОБЯЗАТЕЛЬНО)\n   - lsb-cprocsp-base-*.rpm\n   - lsb-cprocsp-rdr-*.rpm\n   - lsb-cprocsp-kc1-*.rpm   (или kc2, если нужен)\n   - lsb-cprocsp-capilite-*.rpm\n   - cprocsp-curl-*.rpm\n   - lsb-cprocsp-ca-certs-*.rpm\n\nВАЖНО: install.sh сам выберет правильный менеджер пакетов.\n\nКонфигурация: kc1 (по умолчанию) — для экзаменов.\nkc2 используйте только если точно знаете, зачем."),
+        (crypto_dir.clone(), "🔑 КРИПТОПРО + ГИА — ДОПОЛНИТЕЛЬНЫЕ ПАКЕТЫ\n========================================\nКорень папки cryptopro_gia/ — сюда кладите:\n\n1. newt-*.rpm\n   — нужен для install.sh КриптоПро\n\n2. pcsc-lite-*.rpm и pcsc-lite-ccid-*.rpm\n   — демон смарт-карт и драйвер USB-ридеров\n\n3. librtpkcs11ecp-*.rpm\n   — библиотека для токенов Рутокен/Jacarta\n\n4. GIA11_PPE-*.rpm\n   — платформа проведения экзамена (ОБЯЗАТЕЛЬНО)\n\nЕсли какого-то пакета нет — программа скачает его\nиз репозитория (нужен интернет через прокси)."),
+        (cert_dir, "🔒 СЕРТИФИКАТЫ\n========================================\nСюда положите корневые сертификаты (.crt, .pem, .cer)\nдля прокси и внутренних сайтов школы.\n\nОбычно это файл ca-root.crt от вашего прокси-сервера.\n\nПрограмма установит сертификаты:\n1. В системное хранилище (update-ca-trust)\n2. В NSS-базу Chromium (для браузера)\n\nВАЖНО: не кладите файлы, начинающиеся с ._ (это\nmacOS-артефакты, они не являются сертификатами)."),
     ];
 
     for (dir, readme_content) in &dirs_with_readme {
@@ -624,9 +505,7 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
 
 fn is_package_installed(package_name: &str) -> bool {
     let check_cmd = format!("rpm -q {} >/dev/null 2>&1", package_name);
-    Command::new("sh").arg("-c").arg(&check_cmd)
-        .stdout(Stdio::null()).stderr(Stdio::null()).status()
-        .map(|s| s.success()).unwrap_or(false)
+    Command::new("sh").arg("-c").arg(&check_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }
 
 // ==================== ПОИСК ПАКЕТОВ ====================
@@ -680,10 +559,7 @@ fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     }
 
     let _ = tx.send(LogEvent::Line(format!("=== 🌐 Настройка прокси {} ===", proxy_url)));
-    let profile_content = format!(
-        "# Автоматическая настройка прокси (school-installer)\nexport http_proxy=\"{u}\"\nexport https_proxy=\"{u}\"\nexport no_proxy=\"localhost,127.0.0.1,::1\"\n",
-        u = proxy_url
-    );
+    let profile_content = format!("# Автоматическая настройка прокси (school-installer)\nexport http_proxy=\"{u}\"\nexport https_proxy=\"{u}\"\nexport no_proxy=\"localhost,127.0.0.1,::1\"\n", u = proxy_url);
     if let Err(e) = fs::write(profile_path, &profile_content) {
         return (false, format!("❌ Не удалось записать {}: {} (нужен root/sudo)", profile_path, e));
     }
@@ -760,9 +636,7 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         let (home, _) = real_home_and_user();
         let nssdb = format!("sql:{}/.pki/nssdb", home);
         let check_cmd = format!("echo '' | certutil -d '{}' -L 2>/dev/null | grep -q '{}'", nssdb, nick);
-        let in_nss = Command::new("sh").arg("-c").arg(&check_cmd)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status()
-            .map(|s| s.success()).unwrap_or(false);
+        let in_nss = Command::new("sh").arg("-c").arg(&check_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
         if !in_nss { all_in_nss = false; }
     }
     if all_in_anchors && all_in_nss {
@@ -817,9 +691,7 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     for cert in &certs {
         let nick = Path::new(cert).file_stem().unwrap_or_default().to_string_lossy().to_string();
         let check_cmd = format!("echo '' | certutil -d '{}' -L 2>/dev/null | grep -q '{}'", nssdb, nick);
-        let already_in_nss = Command::new("sh").arg("-c").arg(&check_cmd)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status()
-            .map(|s| s.success()).unwrap_or(false);
+        let already_in_nss = Command::new("sh").arg("-c").arg(&check_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
         if already_in_nss {
             let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {} уже установлен", nick)));
             continue;
@@ -854,49 +726,31 @@ fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 
 fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
-
     let (space_ok, space_msg) = check_free_space(download_dir, MIN_FREE_SPACE_UPDATES_MB, "Скачивание обновлений");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok {
-        return (false, space_msg);
-    }
+    if !space_ok { return (false, space_msg); }
 
-    let estimated_size = estimate_dnf_download_size(&[
-        "upgrade", "--downloadonly",
-        "--exclude=*.i686", "--exclude=*.i586", "--exclude=*.i386",
-    ]);
+    let estimated_size = estimate_dnf_download_size(&["upgrade", "--downloadonly", "--exclude=*.i686", "--exclude=*.i586", "--exclude=*.i386"]);
     if let Some(size_mb) = estimated_size {
         let _ = tx.send(LogEvent::Line(format!("📊 Примерный размер скачивания: {}", format_size_mb(size_mb))));
         if size_mb > 0 {
             let (enough, msg) = check_free_space(download_dir, size_mb + 100, "Скачивание обновлений (с запасом 100 МБ)");
             let _ = tx.send(LogEvent::Line(msg));
-            if !enough {
-                return (false, format!("❌ Недостаточно места. Освободите {} и повторите.", format_size_mb(size_mb + 100)));
-            }
+            if !enough { return (false, format!("❌ Недостаточно места. Освободите {} и повторите.", format_size_mb(size_mb + 100))); }
         }
     }
 
-    let abs_path = fs::canonicalize(download_dir)
-        .unwrap_or_else(|_| Path::new(download_dir).to_path_buf());
+    let abs_path = fs::canonicalize(download_dir).unwrap_or_else(|_| Path::new(download_dir).to_path_buf());
     let _ = tx.send(LogEvent::Line(format!("📥 Скачиваю обновления в: {}", abs_path.display())));
 
     let mut cmd = Command::new("dnf");
-    cmd.arg("upgrade")
-        .arg("--downloadonly")
-        .arg("--exclude=*.i686")
-        .arg("--exclude=*.i586")
-        .arg("--exclude=*.i386")
-        .arg(format!("--destdir={}", abs_path.display()))
-        .arg("-y");
+    cmd.arg("upgrade").arg("--downloadonly").arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386").arg(format!("--destdir={}", abs_path.display())).arg("-y");
 
     match run_process(cmd, tx) {
         Ok(s) if s.success() => {
             let rpm_count = find_packages_flat(download_dir, "", &detect_arch()).len();
-            if rpm_count > 0 {
-                (true, format!("Обновления скачаны ({} пакетов)", rpm_count))
-            } else {
-                (false, "dnf отработал, но файлы не найдены в папке. Проверьте /var/cache/dnf/".to_string())
-            }
+            if rpm_count > 0 { (true, format!("Обновления скачаны ({} пакетов)", rpm_count)) }
+            else { (false, "dnf отработал, но файлы не найдены в папке. Проверьте /var/cache/dnf/".to_string()) }
         }
         Ok(_s) => (false, "Ошибка скачивания".to_string()),
         Err(e) => (false, format!("❌ Не удалось запустить dnf: {}", e)),
@@ -905,34 +759,22 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
 
 fn download_packages(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
-
     let (space_ok, space_msg) = check_free_space(download_dir, MIN_FREE_SPACE_PACKAGES_MB, "Скачивание пакетов");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok {
-        return (false, space_msg);
-    }
+    if !space_ok { return (false, space_msg); }
 
-    let mut dnf_args: Vec<String> = vec![
-        "download".to_string(), "--resolve".to_string(), "--alldeps".to_string(),
-        "--exclude=*.i686".to_string(), "--exclude=*.i586".to_string(), "--exclude=*.i386".to_string(),
-    ];
-    for pkg in packages {
-        dnf_args.push(pkg.to_string());
-    }
+    let mut dnf_args: Vec<String> = vec!["download".to_string(), "--resolve".to_string(), "--alldeps".to_string(), "--exclude=*.i686".to_string(), "--exclude=*.i586".to_string(), "--exclude=*.i386".to_string()];
+    for pkg in packages { dnf_args.push(pkg.to_string()); }
     let estimated_size = estimate_dnf_download_size(&dnf_args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     if let Some(size_mb) = estimated_size {
         let _ = tx.send(LogEvent::Line(format!("📊 Примерный размер скачивания: {}", format_size_mb(size_mb))));
         let (enough, msg) = check_free_space(download_dir, size_mb + 100, "Скачивание пакетов (с запасом 100 МБ)");
         let _ = tx.send(LogEvent::Line(msg));
-        if !enough {
-            return (false, format!("❌ Недостаточно места для скачивания пакетов. Освободите {} и повторите.", format_size_mb(size_mb + 100)));
-        }
+        if !enough { return (false, format!("❌ Недостаточно места для скачивания пакетов. Освободите {} и повторите.", format_size_mb(size_mb + 100))); }
     }
 
     let mut cmd = Command::new("dnf");
-    cmd.arg("download").arg("--resolve").arg("--alldeps")
-        .arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386")
-        .arg(format!("--destdir={}", download_dir));
+    cmd.arg("download").arg("--resolve").arg("--alldeps").arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386").arg(format!("--destdir={}", download_dir));
     for pkg in packages { cmd.arg(pkg); }
     match run_process(cmd, tx) {
         Ok(s) if s.success() => (true, "Пакеты скачаны".to_string()),
@@ -946,21 +788,15 @@ fn download_packages(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<Lo
 fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
     let files = find_packages_flat(download_dir, "", &system_arch);
-    if files.is_empty() {
-        return (false, format!("❌ В папке '{}' нет .rpm файлов", download_dir));
-    }
+    if files.is_empty() { return (false, format!("❌ В папке '{}' нет .rpm файлов", download_dir)); }
     let _ = tx.send(LogEvent::Line(format!("Найдено {} пакетов для установки", files.len())));
 
-    let total_size_bytes: u64 = files.iter()
-        .filter_map(|f| fs::metadata(f).ok().map(|m| m.len()))
-        .sum();
+    let total_size_bytes: u64 = files.iter().filter_map(|f| fs::metadata(f).ok().map(|m| m.len())).sum();
     let total_size_mb = total_size_bytes / (1024 * 1024);
     let required_mb = total_size_mb * 3;
     let (space_ok, space_msg) = check_free_space(download_dir, required_mb.max(MIN_FREE_SPACE_CRITICAL_MB), "Установка пакетов");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok {
-        return (false, format!("{} Размер пакетов: {}, для установки нужно ~{}", space_msg, format_size_mb(total_size_mb), format_size_mb(required_mb)));
-    }
+    if !space_ok { return (false, format!("{} Размер пакетов: {}, для установки нужно ~{}", space_msg, format_size_mb(total_size_mb), format_size_mb(required_mb))); }
 
     let mut installed = 0;
     for chunk in files.chunks(80) {
@@ -973,49 +809,35 @@ fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool
             Err(e) => { let _ = tx.send(LogEvent::Line(format!("❌ Ошибка: {}", e))); }
         }
     }
-    if installed > 0 {
-        (true, format!("Установлено пакетов: {}", installed))
-    } else {
-        (false, "Не удалось установить ни одного пакета".to_string())
-    }
+    if installed > 0 { (true, format!("Установлено пакетов: {}", installed)) }
+    else { (false, "Не удалось установить ни одного пакета".to_string()) }
 }
 
 // ==================== КРИПТОПРО + ГИА ====================
 
 fn download_package_to_folder(package_name: &str, folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(folder);
-
     let (space_ok, space_msg) = check_free_space(folder, 100, format!("Скачивание {}", package_name));
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok {
-        return (false, space_msg);
-    }
+    if !space_ok { return (false, space_msg); }
 
     let mut cmd = Command::new("dnf");
-    cmd.arg("download")
-        .arg(format!("--destdir={}", folder))
-        .arg(package_name);
+    cmd.arg("download").arg(format!("--destdir={}", folder)).arg(package_name);
 
     match run_process(cmd, tx) {
         Ok(s) if s.success() => {
             let files = find_packages_by_substring(folder, package_name, &detect_arch());
-            if !files.is_empty() {
-                return (true, format!("{} скачан ({} файлов)", package_name, files.len()));
-            }
+            if !files.is_empty() { return (true, format!("{} скачан ({} файлов)", package_name, files.len())); }
             let _ = tx.send(LogEvent::Line("Файлы не в папке, ищу в кэше dnf...".to_string()));
             let cache_search = format!("find /var/cache/dnf -name '*{}*.rpm' -type f 2>/dev/null | head -5", package_name);
             if let Ok(output) = Command::new("sh").arg("-c").arg(&cache_search).output() {
                 let cache_files = String::from_utf8_lossy(&output.stdout);
                 if !cache_files.trim().is_empty() {
                     for cache_file in cache_files.lines() {
-                        if !cache_file.is_empty() {
-                            let _ = Command::new("cp").arg(cache_file).arg(folder).status();
-                        }
+                        if !cache_file.is_empty() { let _ = Command::new("cp").arg(cache_file).arg(folder).status(); }
                     }
                     let files = find_packages_by_substring(folder, package_name, &detect_arch());
-                    if !files.is_empty() {
-                        return (true, format!("{} скачан через кэш", package_name));
-                    }
+                    if !files.is_empty() { return (true, format!("{} скачан через кэш", package_name)); }
                 }
             }
             (false, format!("{} скачан, но файлы не найдены", package_name))
@@ -1029,16 +851,12 @@ fn install_local_packages(folder: &str, pattern: &str, tx: &mpsc::Sender<LogEven
     let files = find_packages_by_substring(folder, pattern, &detect_arch());
     if files.is_empty() { return (false, format!("❌ Не найдено *{}*.rpm в папке {}", pattern, folder)); }
 
-    let total_size_bytes: u64 = files.iter()
-        .filter_map(|f| fs::metadata(f).ok().map(|m| m.len()))
-        .sum();
+    let total_size_bytes: u64 = files.iter().filter_map(|f| fs::metadata(f).ok().map(|m| m.len())).sum();
     let total_size_mb = total_size_bytes / (1024 * 1024);
     let required_mb = total_size_mb * 3;
     let (space_ok, space_msg) = check_free_space(folder, required_mb.max(100), format!("Установка {}", pattern));
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok {
-        return (false, space_msg);
-    }
+    if !space_ok { return (false, space_msg); }
 
     let _ = tx.send(LogEvent::Line(format!("Устанавливаю {} пакетов ({}): {}", files.len(), format_size_mb(total_size_mb), pattern)));
     let mut cmd = Command::new("dnf");
@@ -1059,9 +877,7 @@ fn install_cryptopro_csp(crypto_subdir: &str, tx: &mpsc::Sender<LogEvent>) -> (b
 
     let (space_ok, space_msg) = check_free_space(crypto_subdir, MIN_FREE_SPACE_CRYPTO_MB, "Установка КриптоПро CSP");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok {
-        return (false, space_msg);
-    }
+    if !space_ok { return (false, space_msg); }
 
     let _ = tx.send(LogEvent::Line("Запускаю install.sh КриптоПро (kc1, --yes)...".to_string()));
     let mut cmd = Command::new("sh");
@@ -1080,9 +896,7 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
 
     let (space_ok, space_msg) = check_free_space(crypto_dir, MIN_FREE_SPACE_CRYPTO_MB, "Установка КриптоПро + ГИА");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok {
-        return (false, space_msg);
-    }
+    if !space_ok { return (false, space_msg); }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 1/5: newt ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.0, "Шаг 1: newt...".to_string()));
@@ -1155,9 +969,7 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
     (true, "Установлено: newt, pcsc-lite, librtpkcs11ecp, КриптоПро CSP, GIA11_PPE".to_string())
 }
 
-fn get_packages() -> Vec<&'static str> {
-    vec!["task-koge", "r7-office", "notepadqq"]
-}
+fn get_packages() -> Vec<&'static str> { vec!["task-koge", "r7-office", "notepadqq"] }
 
 // ==================== ДИСПЕТЧЕР КОМАНД ====================
 
@@ -1181,8 +993,7 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
         }
     }
 
-    let needs_prepare = matches!(cmd_id,
-        "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia");
+    let needs_prepare = matches!(cmd_id, "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia");
     if needs_prepare {
         let (ok, msg) = prepare_environment(tx);
         if !ok {
@@ -1255,29 +1066,12 @@ const COMMANDS: &[CommandItem] = &[
 ];
 
 fn needs_confirmation(cmd_id: &str) -> bool {
-    matches!(cmd_id,
-        "setup_env" | "download_updates" | "install_updates" |
-        "download_packages" | "install_packages" | "install_cryptopro_gia"
-    )
+    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    let popup_layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)]).split(r);
+    Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)]).split(popup_layout[1])[1]
 }
 
 struct App {
@@ -1288,7 +1082,7 @@ struct App {
     arch: String,
     progress: f64,
     progress_label: String,
-    log_lines: Vec<String>,
+    log_lines: Vec<Line<'static>>, // УЛУЧШЕНИЕ №6: храним стилизованные строки
     log_rx: Option<mpsc::Receiver<LogEvent>>,
     first_run_shown: bool,
     show_help: bool,
@@ -1326,14 +1120,8 @@ impl App {
     fn select_by_hotkey(&mut self, key: char) {
         if self.is_running || self.pending_command.is_some() { return; }
         match key {
-            '1' => self.selected = 0,
-            '2' => self.selected = 1,
-            '3' => self.selected = 2,
-            '4' => self.selected = 3,
-            '5' => self.selected = 4,
-            '6' => self.selected = 5,
-            '7' => self.selected = 6,
-            '0' => self.selected = 7,
+            '1' => self.selected = 0, '2' => self.selected = 1, '3' => self.selected = 2, '4' => self.selected = 3,
+            '5' => self.selected = 4, '6' => self.selected = 5, '7' => self.selected = 6, '0' => self.selected = 7,
             _ => return,
         }
         self.list_state.select(Some(self.selected));
@@ -1343,7 +1131,6 @@ impl App {
         if self.is_running || self.pending_command.is_some() { return; }
         let cmd_idx = self.selected;
         let cmd = COMMANDS[cmd_idx].clone();
-        
         if needs_confirmation(cmd.id) {
             self.pending_command = Some(cmd_idx);
             self.status = format!("⚠️ Требуется подтверждение: {}", cmd.name);
@@ -1351,7 +1138,6 @@ impl App {
             self.start_command(cmd_idx);
         }
     }
-
     fn start_command(&mut self, idx: usize) {
         let cmd = COMMANDS[idx].clone();
         self.is_running = true;
@@ -1366,7 +1152,6 @@ impl App {
         thread::spawn(move || { run_command(&cmd_id, &tx); });
         self.log_rx = Some(rx);
     }
-
     fn toggle_help(&mut self) {
         if self.is_running || self.pending_command.is_some() { return; }
         self.show_help = !self.show_help;
@@ -1377,8 +1162,9 @@ impl App {
             while let Ok(ev) = receiver.try_recv() {
                 match ev {
                     LogEvent::Line(s) => {
-                        self.log_lines.push(s.clone());
-                        log_to_file(&s);  // УЛУЧШЕНИЕ №5: дублируем в файл
+                        // УЛУЧШЕНИЕ №6: сохраняем раскрашенную строку
+                        self.log_lines.push(colorize_log_line(&s));
+                        log_to_file(&s);
                         if self.log_lines.len() > 800 { self.log_lines.remove(0); }
                     }
                     LogEvent::Progress(p, label) => {
@@ -1403,10 +1189,7 @@ impl App {
 }
 
 fn ui(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3), Constraint::Length(3)])
-        .split(f.area());
+    let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3), Constraint::Length(3)]).split(f.area());
 
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(" ШКОЛЬНЫЙ УСТАНОВЩИК ПО ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -1416,19 +1199,12 @@ fn ui(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(header, chunks[0]);
 
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(chunks[1]);
+    let main_chunks = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(45), Constraint::Percentage(55)]).split(chunks[1]);
 
     let items: Vec<ListItem> = COMMANDS.iter().enumerate().map(|(i, cmd)| {
-        let style = if i == app.selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else if app.is_running {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let style = if i == app.selected { Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD) }
+                    else if app.is_running { Style::default().fg(Color::DarkGray) }
+                    else { Style::default().fg(Color::White) };
         let hotkey_str = if cmd.hotkey == '0' { "0".to_string() } else { format!("{}", cmd.hotkey) };
         ListItem::new(Line::from(vec![
             Span::styled(format!("{} ", hotkey_str), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1437,69 +1213,48 @@ fn ui(f: &mut Frame, app: &App) {
         ]))
     }).collect();
 
-    let menu_title = if app.show_help {
-        " ГОРЯЧИЕ КЛАВИШИ: 1-7=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход "
-    } else if app.pending_command.is_some() {
-        " ⚠️ ОЖИДАНИЕ ПОДТВЕРЖДЕНИЯ: Y=да, N=отмена "
-    } else {
-        " КОМАНДЫ (1-7: выбор, h: помощь, ↑↓, Enter, q) "
-    };
+    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-7=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
+                     else if app.pending_command.is_some() { " ⚠️ ОЖИДАНИЕ ПОДТВЕРЖДЕНИЯ: Y=да, N=отмена " }
+                     else { " КОМАНДЫ (1-7: выбор, h: помощь, ↑↓, Enter, q) " };
 
-    let commands_list = List::new(items)
-        .block(Block::default().title(menu_title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-        .highlight_symbol("▸ ");
+    let commands_list = List::new(items).block(Block::default().title(menu_title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
 
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(0)])
-        .split(main_chunks[1]);
+    let right_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(8), Constraint::Min(0)]).split(main_chunks[1]);
 
     if app.show_help {
         let help_text = vec![
             Line::from(Span::styled("⌨️  ГОРЯЧИЕ КЛАВИШИ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
             Line::from(""),
-            Line::from("  1 — ℹ Информация и инструкция"),
-            Line::from("  2 — 🌐 Настроить прокси + сертификат"),
-            Line::from("  3 — ⬇ Скачать обновления системы"),
-            Line::from("  4 — ⬆ Установить обновления"),
-            Line::from("  5 — 📦 Скачать пакеты"),
-            Line::from("  6 — 🚀 Установить пакеты"),
-            Line::from("  7 — 🔐 Установить КриптоПро + ГИА"),
-            Line::from("  0 — ✕ Выход"),
+            Line::from("  1 — ℹ Информация и инструкция"), Line::from("  2 — 🌐 Настроить прокси + сертификат"),
+            Line::from("  3 — ⬇ Скачать обновления системы"), Line::from("  4 — ⬆ Установить обновления"),
+            Line::from("  5 — 📦 Скачать пакеты"), Line::from("  6 — 🚀 Установить пакеты"),
+            Line::from("  7 — 🔐 Установить КриптоПро + ГИА"), Line::from("  0 — ✕ Выход"),
             Line::from(""),
-            Line::from("  ↑/k — предыдущий пункт"),
-            Line::from("  ↓/j — следующий пункт"),
-            Line::from("  Enter — выполнить выбранный пункт"),
-            Line::from("  h — показать/скрыть эту справку"),
-            Line::from("  q/Esc — выход"),
-            Line::from("  Ctrl+C — аварийный выход"),
+            Line::from("  ↑/k — предыдущий пункт"), Line::from("  ↓/j — следующий пункт"),
+            Line::from("  Enter — выполнить выбранный пункт"), Line::from("  h — показать/скрыть эту справку"),
+            Line::from("  q/Esc — выход"), Line::from("  Ctrl+C — аварийный выход"),
             Line::from(""),
             Line::from(Span::styled("💡 Совет: нажмите цифру — команда запустится мгновенно!", Style::default().fg(Color::Green))),
         ];
-        let help_widget = Paragraph::new(help_text)
-            .block(Block::default().title(" СПРАВКА ПО ГОРЯЧИМ КЛАВИШАМ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)))
-            .wrap(Wrap { trim: false });
+        let help_widget = Paragraph::new(help_text).block(Block::default().title(" СПРАВКА ПО ГОРЯЧИМ КЛАВИШАМ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow))).wrap(Wrap { trim: false });
         f.render_widget(help_widget, right_chunks[0]);
     } else {
         let selected_cmd = &COMMANDS[app.selected];
         let desc = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("Команда: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("[{}] {}", selected_cmd.hotkey, selected_cmd.name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from(vec![Span::styled("Команда: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::styled(format!("[{}] {}", selected_cmd.hotkey, selected_cmd.name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
             Line::from(""),
             Line::from(selected_cmd.description),
-        ])
-        .block(Block::default().title(" ОПИСАНИЕ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-        .wrap(Wrap { trim: false });
+        ]).block(Block::default().title(" ОПИСАНИЕ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).wrap(Wrap { trim: false });
         f.render_widget(desc, right_chunks[0]);
     }
 
+    // УЛУЧШЕНИЕ №6: рендерим цветные строки лога
     let height = right_chunks[1].height.saturating_sub(2) as usize;
     let start = app.log_lines.len().saturating_sub(height);
-    let log_text = app.log_lines[start..].join("\n");
-    let log_widget = Paragraph::new(log_text)
+    let visible_lines: Vec<Line> = app.log_lines[start..].to_vec();
+
+    let log_widget = Paragraph::new(visible_lines)
         .block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
         .wrap(Wrap { trim: false });
     f.render_widget(log_widget, right_chunks[1]);
@@ -1528,40 +1283,21 @@ fn ui(f: &mut Frame, app: &App) {
     if let Some(idx) = app.pending_command {
         let area = centered_rect(60, 30, f.area());
         f.render_widget(Clear, area);
-
-        let block = Block::default()
-            .title(" ⚠️ ПОДТВЕРЖДЕНИЕ ДЕЙСТВИЯ ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+        let block = Block::default().title(" ⚠️ ПОДТВЕРЖДЕНИЕ ДЕЙСТВИЯ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
         f.render_widget(block, area);
-
         let inner_area = area.inner(Margin { vertical: 2, horizontal: 3 });
         let text = vec![
             Line::from(""),
             Line::from(Span::styled("Вы собираетесь выполнить:", Style::default().fg(Color::White))),
             Line::from(""),
-            Line::from(Span::styled(
-                format!("  [{}] {}", COMMANDS[idx].hotkey, COMMANDS[idx].name),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            )),
+            Line::from(Span::styled(format!("  [{}] {}", COMMANDS[idx].hotkey, COMMANDS[idx].name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
             Line::from(""),
-            Line::from(Span::styled(
-                "Это действие изменит систему или скачает данные.",
-                Style::default().fg(Color::Red)
-            )),
+            Line::from(Span::styled("Это действие изменит систему или скачает данные.", Style::default().fg(Color::Red))),
             Line::from(""),
-            Line::from(Span::styled(
-                "Нажмите [Y] для подтверждения",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-            )),
-            Line::from(Span::styled(
-                "Нажмите [N] или Esc для отмены",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            )),
+            Line::from(Span::styled("Нажмите [Y] для подтверждения", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("Нажмите [N] или Esc для отмены", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
         ];
-        let paragraph = Paragraph::new(text)
-            .block(Block::default().borders(Borders::NONE))
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(text).block(Block::default().borders(Borders::NONE)).wrap(Wrap { trim: false });
         f.render_widget(paragraph, inner_area);
     }
 }
@@ -1569,11 +1305,7 @@ fn ui(f: &mut Frame, app: &App) {
 // ==================== ТОЧКА ВХОДА ====================
 
 fn main() -> io::Result<()> {
-    if !check_root() {
-        require_root_and_exit();
-    }
-
-    // УЛУЧШЕНИЕ №5: инициализация логирования
+    if !check_root() { require_root_and_exit(); }
     log_session_start();
 
     let args: Vec<String> = env::args().collect();
@@ -1620,9 +1352,7 @@ fn main() -> io::Result<()> {
                 println!("Папка КриптоПро: {}", get_crypto_dir());
                 println!("Папка пакетов: {}", get_school_packages_dir());
                 println!("Папка обновлений: {}", get_updates_dir());
-                if let Some(free_mb) = get_free_space_mb(".") {
-                    println!("💾 Свободно на диске: {}", format_size_mb(free_mb));
-                }
+                if let Some(free_mb) = get_free_space_mb(".") { println!("💾 Свободно на диске: {}", format_size_mb(free_mb)); }
                 println!("\n📝 Лог: {}", log_file_path());
                 return Ok(());
             }
@@ -1640,25 +1370,15 @@ fn main() -> io::Result<()> {
         ensure_directories();
         let (tx, rx) = mpsc::channel::<LogEvent>();
         let cmd_id = match mode {
-            "setup-env" => "setup_env",
-            "download-updates" => "download_updates",
-            "install-updates" => "install_updates",
-            "download-packages" => "download_packages",
-            "install-packages" => "install_packages",
-            "install-crypto-gia" => "install_cryptopro_gia",
+            "setup-env" => "setup_env", "download-updates" => "download_updates", "install-updates" => "install_updates",
+            "download-packages" => "download_packages", "install-packages" => "install_packages", "install-crypto-gia" => "install_cryptopro_gia",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
         thread::spawn(move || run_command(&cmd_id, &tx));
         loop {
             match rx.recv() {
-                Ok(LogEvent::Line(s)) => {
-                    println!("{}", s);
-                    log_to_file(&s);
-                }
-                Ok(LogEvent::Progress(p, l)) => {
-                    println!("[{:>3.0}%] {}", p * 100.0, l);
-                    log_to_file(&format!("[PROGRESS] {} {}", p, l));
-                }
+                Ok(LogEvent::Line(s)) => { println!("{}", s); log_to_file(&s); }
+                Ok(LogEvent::Progress(p, l)) => { println!("[{:>3.0}%] {}", p * 100.0, l); log_to_file(&format!("[PROGRESS] {} {}", p, l)); }
                 Ok(LogEvent::Done(ok, msg)) => {
                     println!("{}", msg);
                     log_to_file(&format!("=== ЗАВЕРШЕНО: {} ===", msg));
@@ -1681,9 +1401,7 @@ fn main() -> io::Result<()> {
     if !app.first_run_shown {
         app.first_run_shown = true;
         let (tx, rx) = mpsc::channel::<LogEvent>();
-        thread::spawn(move || {
-            run_command("detect_os", &tx);
-        });
+        thread::spawn(move || { run_command("detect_os", &tx); });
         app.log_rx = Some(rx);
     }
 
@@ -1697,35 +1415,20 @@ fn main() -> io::Result<()> {
                 if let Some(pending_idx) = app.pending_command {
                     if let KeyCode::Char(c) = key.code {
                         match c {
-                            'y' | 'Y' | 'н' | 'Н' => {
-                                app.start_command(pending_idx);
-                            }
-                            'n' | 'N' | 'т' | 'Т' | 'q' | 'Q' => {
-                                app.pending_command = None;
-                                app.status = "❌ Отменено пользователем".to_string();
-                            }
+                            'y' | 'Y' | 'н' | 'Н' => { app.start_command(pending_idx); }
+                            'n' | 'N' | 'т' | 'Т' | 'q' | 'Q' => { app.pending_command = None; app.status = "❌ Отменено пользователем".to_string(); }
                             _ => {}
                         }
                     }
-                    if key.code == KeyCode::Esc {
-                        app.pending_command = None;
-                        app.status = "❌ Отменено пользователем".to_string();
-                    }
+                    if key.code == KeyCode::Esc { app.pending_command = None; app.status = "❌ Отменено пользователем".to_string(); }
                     continue;
                 }
 
                 if let KeyCode::Char(c) = key.code {
                     if !app.is_running {
                         match c {
-                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '0' => {
-                                app.select_by_hotkey(c);
-                                if c == '0' { break; }
-                                continue;
-                            }
-                            'h' | 'H' | 'р' | 'Р' => {
-                                app.toggle_help();
-                                continue;
-                            }
+                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '0' => { app.select_by_hotkey(c); if c == '0' { break; } continue; }
+                            'h' | 'H' | 'р' | 'Р' => { app.toggle_help(); continue; }
                             _ => {}
                         }
                     }
