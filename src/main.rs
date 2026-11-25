@@ -5,10 +5,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::collections::HashMap;
@@ -62,10 +62,6 @@ fn require_root_and_exit() -> ! {
     eprintln!("║                                                              ║");
     eprintln!("║  💡  Запустите через sudo:                                   ║");
     eprintln!("║      sudo ./school-installer                                 ║");
-    eprintln!("║                                                              ║");
-    eprintln!("║  💡  Для CLI-команд:                                         ║");
-    eprintln!("║      sudo ./school-installer --download-packages             ║");
-    eprintln!("║      sudo ./school-installer --set-proxy <URL>               ║");
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
     eprintln!();
     std::process::exit(1);
@@ -1164,11 +1160,9 @@ struct CommandItem {
     name: &'static str,
     description: &'static str,
     icon: &'static str,
-    hotkey: char,  // УЛУЧШЕНИЕ №3: горячая клавиша
+    hotkey: char,
 }
 
-// ⚠ ВАЖНО: эмодзи только в поле icon, в name их нет — иначе в меню будет дублирование
-// УЛУЧШЕНИЕ №3: добавлено поле hotkey для каждой команды
 const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
     CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
@@ -1179,6 +1173,34 @@ const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "5 шагов: newt → pcsc-lite → librtpkcs11ecp → КриптоПро → GIA11_PPE → pcscd. Проверяет свободное место (мин. 500 МБ).", icon: "🔐", hotkey: '7' },
     CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕", hotkey: '0' },
 ];
+
+// УЛУЧШЕНИЕ №4: Список команд, требующих подтверждения
+fn needs_confirmation(cmd_id: &str) -> bool {
+    matches!(cmd_id,
+        "setup_env" | "download_updates" | "install_updates" |
+        "download_packages" | "install_packages" | "install_cryptopro_gia"
+    )
+}
+
+// УЛУЧШЕНИЕ №4: Вспомогательная функция для центрирования модального окна
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
 
 struct App {
     selected: usize,
@@ -1191,7 +1213,8 @@ struct App {
     log_lines: Vec<String>,
     log_rx: Option<mpsc::Receiver<LogEvent>>,
     first_run_shown: bool,
-    show_help: bool,  // УЛУЧШЕНИЕ №3: флаг показа справки по горячим клавишам
+    show_help: bool,
+    pending_command: Option<usize>, // УЛУЧШЕНИЕ №4: индекс команды, ожидающей подтверждения
 }
 
 impl App {
@@ -1209,21 +1232,21 @@ impl App {
             log_lines: Vec::new(), log_rx: None,
             first_run_shown: false,
             show_help: false,
+            pending_command: None,
         }
     }
     fn next(&mut self) {
-        if self.is_running { return; }
+        if self.is_running || self.pending_command.is_some() { return; }
         self.selected = if self.selected >= COMMANDS.len() - 1 { 0 } else { self.selected + 1 };
         self.list_state.select(Some(self.selected));
     }
     fn previous(&mut self) {
-        if self.is_running { return; }
+        if self.is_running || self.pending_command.is_some() { return; }
         self.selected = if self.selected == 0 { COMMANDS.len() - 1 } else { self.selected - 1 };
         self.list_state.select(Some(self.selected));
     }
-    // УЛУЧШЕНИЕ №3: выбор команды по номеру (1-8, 0 = выход)
     fn select_by_hotkey(&mut self, key: char) {
-        if self.is_running { return; }
+        if self.is_running || self.pending_command.is_some() { return; }
         match key {
             '1' => self.selected = 0,
             '2' => self.selected = 1,
@@ -1232,32 +1255,44 @@ impl App {
             '5' => self.selected = 4,
             '6' => self.selected = 5,
             '7' => self.selected = 6,
-            '0' => self.selected = 7,  // Выход
+            '0' => self.selected = 7,
             _ => return,
         }
         self.list_state.select(Some(self.selected));
-        // Автоматически выполняем выбранную команду
-        if COMMANDS[self.selected].id == "exit" {
-            // Выход обрабатывается в основном цикле
-            return;
-        }
         self.execute_selected();
     }
     fn execute_selected(&mut self) {
-        if self.is_running { return; }
-        let cmd = COMMANDS[self.selected].clone();
+        if self.is_running || self.pending_command.is_some() { return; }
+        let cmd_idx = self.selected;
+        let cmd = COMMANDS[cmd_idx].clone();
+        
+        // УЛУЧШЕНИЕ №4: если команда деструктивная — запрашиваем подтверждение
+        if needs_confirmation(cmd.id) {
+            self.pending_command = Some(cmd_idx);
+            self.status = format!("⚠️ Требуется подтверждение: {}", cmd.name);
+        } else {
+            self.start_command(cmd_idx);
+        }
+    }
+
+    // УЛУЧШЕНИЕ №4: запуск команды (без проверки подтверждения)
+    fn start_command(&mut self, idx: usize) {
+        let cmd = COMMANDS[idx].clone();
         self.is_running = true;
         self.progress = 0.0;
         self.progress_label = format!("Выполняю: {}...", cmd.name);
         self.status = format!("▶ {}", cmd.name);
         self.log_lines.clear();
-        self.show_help = false;  // Скрываем справку при запуске команды
+        self.pending_command = None;
+        self.show_help = false;
         let (tx, rx) = mpsc::channel::<LogEvent>();
-        thread::spawn(move || { run_command(cmd.id, &tx); });
+        let cmd_id = cmd.id.to_string();
+        thread::spawn(move || { run_command(&cmd_id, &tx); });
         self.log_rx = Some(rx);
     }
+
     fn toggle_help(&mut self) {
-        if self.is_running { return; }
+        if self.is_running || self.pending_command.is_some() { return; }
         self.show_help = !self.show_help;
     }
     fn poll_events(&mut self) {
@@ -1304,7 +1339,6 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[1]);
 
-    // УЛУЧШЕНИЕ №3: в меню показываем номер + иконка + имя
     let items: Vec<ListItem> = COMMANDS.iter().enumerate().map(|(i, cmd)| {
         let style = if i == app.selected {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -1313,7 +1347,6 @@ fn ui(f: &mut Frame, app: &App) {
         } else {
             Style::default().fg(Color::White)
         };
-        // Формат: "1 ℹ Информация и инструкция"
         let hotkey_str = if cmd.hotkey == '0' { "0".to_string() } else { format!("{}", cmd.hotkey) };
         ListItem::new(Line::from(vec![
             Span::styled(format!("{} ", hotkey_str), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1322,11 +1355,12 @@ fn ui(f: &mut Frame, app: &App) {
         ]))
     }).collect();
 
-    // УЛУЧШЕНИЕ №3: в заголовке меню показываем подсказку по горячим клавишам
     let menu_title = if app.show_help {
-        " ГОРЯЧИЕ КЛАВИШИ: 1-8=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход "
+        " ГОРЯЧИЕ КЛАВИШИ: 1-7=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход "
+    } else if app.pending_command.is_some() {
+        " ⚠️ ОЖИДАНИЕ ПОДТВЕРЖДЕНИЯ: Y=да, N=отмена "
     } else {
-        " КОМАНДЫ (1-8: выбор, h: помощь, ↑↓, Enter, q) "
+        " КОМАНДЫ (1-7: выбор, h: помощь, ↑↓, Enter, q) "
     };
 
     let commands_list = List::new(items)
@@ -1339,7 +1373,6 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Length(8), Constraint::Min(0)])
         .split(main_chunks[1]);
 
-    // УЛУЧШЕНИЕ №3: если show_help=true — показываем справку вместо описания
     if app.show_help {
         let help_text = vec![
             Line::from(Span::styled("⌨️  ГОРЯЧИЕ КЛАВИШИ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
@@ -1402,13 +1435,54 @@ fn ui(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(progress_bar, chunks[2]);
 
-    let status_color = if app.status.starts_with("✅") { Color::Green } else if app.status.starts_with("❌") { Color::Red } else if app.status.starts_with("▶") { Color::Yellow } else { Color::White };
+    let status_color = if app.status.starts_with("✅") { Color::Green } else if app.status.starts_with("❌") { Color::Red } else if app.status.starts_with("▶") { Color::Yellow } else if app.status.starts_with("⚠️") { Color::Yellow } else { Color::White };
     let status_widget = Paragraph::new(vec![Line::from(vec![
         Span::styled(" Статус: ", Style::default().fg(Color::Cyan)),
         Span::styled(app.status.as_str(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
     ])])
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(status_widget, chunks[3]);
+
+    // УЛУЧШЕНИЕ №4: Рендер модального окна подтверждения
+    if let Some(idx) = app.pending_command {
+        let area = centered_rect(60, 30, f.area());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(" ⚠️ ПОДТВЕРЖДЕНИЕ ДЕЙСТВИЯ ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+        f.render_widget(block, area);
+
+        let inner_area = area.inner(Margin { vertical: 2, horizontal: 3 });
+        let text = vec![
+            Line::from(""),
+            Line::from(Span::styled("Вы собираетесь выполнить:", Style::default().fg(Color::White))),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  [{}] {}", COMMANDS[idx].hotkey, COMMANDS[idx].name),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Это действие изменит систему или скачает данные.",
+                Style::default().fg(Color::Red)
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Нажмите [Y] для подтверждения",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            )),
+            Line::from(Span::styled(
+                "Нажмите [N] или Esc для отмены",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            )),
+        ];
+        let paragraph = Paragraph::new(text)
+            .block(Block::default().borders(Borders::NONE))
+            .wrap(Wrap { trim: false });
+        f.render_widget(paragraph, inner_area);
+    }
 }
 
 // ==================== ТОЧКА ВХОДА ====================
@@ -1489,7 +1563,7 @@ fn main() -> io::Result<()> {
             "install-crypto-gia" => "install_cryptopro_gia",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
-        thread::spawn(move || run_command(cmd_id, &tx));
+        thread::spawn(move || run_command(&cmd_id, &tx));
         loop {
             match rx.recv() {
                 Ok(LogEvent::Line(s)) => println!("{}", s),
@@ -1527,18 +1601,38 @@ fn main() -> io::Result<()> {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { break; }
-                
+
+                // УЛУЧШЕНИЕ №4: Обработка подтверждения
+                if let Some(pending_idx) = app.pending_command {
+                    if let KeyCode::Char(c) = key.code {
+                        match c {
+                            'y' | 'Y' | 'н' | 'Н' => {
+                                app.start_command(pending_idx);
+                            }
+                            'n' | 'N' | 'т' | 'Т' | 'q' | 'Q' => {
+                                app.pending_command = None;
+                                app.status = "❌ Отменено пользователем".to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if key.code == KeyCode::Esc {
+                        app.pending_command = None;
+                        app.status = "❌ Отменено пользователем".to_string();
+                    }
+                    continue; // Не обрабатываем другие клавиши пока висит подтверждение
+                }
+
                 // УЛУЧШЕНИЕ №3: обработка горячих клавиш 0-9
                 if let KeyCode::Char(c) = key.code {
                     if !app.is_running {
                         match c {
                             '1' | '2' | '3' | '4' | '5' | '6' | '7' | '0' => {
                                 app.select_by_hotkey(c);
-                                // Если выбрали выход — прерываем цикл
                                 if c == '0' { break; }
                                 continue;
                             }
-                            'h' | 'H' | 'р' | 'Р' => {  // 'h' и русская 'р' (одна клавиша)
+                            'h' | 'H' | 'р' | 'Р' => {
                                 app.toggle_help();
                                 continue;
                             }
@@ -1546,7 +1640,7 @@ fn main() -> io::Result<()> {
                         }
                     }
                 }
-                
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
