@@ -27,6 +27,8 @@ const SETTINGS_FILE: &str = "school-installer.conf";
 const LOG_FILE: &str = "school-installer.log";
 const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const CERT_FILE_NAME: &str = "ca-root.crt";
+const PROXY_TEST_URL: &str = "http://ya.ru";
+const PROXY_TEST_TIMEOUT_SECS: u64 = 5;
 
 const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
 const DEFAULT_CERT_DIR: &str = "cer";
@@ -117,9 +119,7 @@ fn get_free_space_mb(path: &str) -> Option<u64> {
                 let fields: Vec<&str> = line.split_whitespace().collect();
                 if fields.len() >= 4 {
                     let size_str = fields[3].trim_end_matches('M');
-                    if let Ok(size) = size_str.parse::<u64>() {
-                        return Some(size);
-                    }
+                    if let Ok(size) = size_str.parse::<u64>() { return Some(size); }
                 }
             }
             None
@@ -304,13 +304,13 @@ fn colorize_log_line(text: &str) -> Line<'static> {
     let t = text.trim();
     let color = if t.is_empty() {
         Color::White
-    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") {
+    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") || t.contains("Найден") {
         Color::Green
     } else if t.starts_with("❌") || t.starts_with("[X]") || t.contains("Ошибка") || t.contains("не удалось") || t.contains("не найден") {
         Color::Red
     } else if t.starts_with("⚠") || t.starts_with("[!]") || t.contains("ВНИМАНИЕ") || t.contains("пропускаем") {
         Color::Yellow
-    } else if t.starts_with("📊") || t.starts_with("📥") || t.starts_with("💾") || t.starts_with("🔒") || t.starts_with("🌐") || t.starts_with("🔐") || t.starts_with("📦") || t.starts_with("🚀") || t.starts_with("🔑") {
+    } else if t.starts_with("📊") || t.starts_with("📥") || t.starts_with("💾") || t.starts_with("🔒") || t.starts_with("🌐") || t.starts_with("🔐") || t.starts_with("📦") || t.starts_with("🚀") || t.starts_with("🔑") || t.starts_with("🔍") || t.starts_with("⚙") {
         Color::Cyan
     } else if t.starts_with("===") {
         Color::Magenta
@@ -412,7 +412,7 @@ fn is_package_for_arch(filename: &str, system_arch: &str) -> bool {
     true
 }
 
-// ==================== АВТОСОЗДАНИЕ ПАПОК И ИНСТРУКЦИЙ ====================
+// ==================== АВТОСОЗДАНИЕ ПАПОК ====================
 
 fn ensure_directories() {
     let base_packages = get_school_packages_dir();
@@ -545,34 +545,20 @@ fn find_packages_by_substring(folder: &str, substring: &str, system_arch: &str) 
 
 // ==================== УЛУЧШЕНИЕ №7: ПОИСК СЕРТИФИКАТА НА USB ====================
 
-/// Ищет файл сертификата на всех смонтированных устройствах
 fn find_cert_on_mounted_devices() -> Option<String> {
-    let search_paths = vec![
-        "/run/media/*/*",
-        "/media/*/*",
-        "/mnt/*",
-    ];
-
+    let search_paths = vec!["/run/media/*/*", "/media/*/*", "/mnt/*"];
     for pattern in &search_paths {
         if let Some(path) = search_pattern(pattern) {
             let cert_path = Path::new(&path).join(CERT_FILE_NAME);
-            if cert_path.exists() {
-                return Some(cert_path.to_string_lossy().to_string());
-            }
+            if cert_path.exists() { return Some(cert_path.to_string_lossy().to_string()); }
         }
     }
     None
 }
 
-/// Ищет первый путь по glob-паттерну
 fn search_pattern(pattern: &str) -> Option<String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!("ls -d {} 2>/dev/null | head -1", pattern))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
+    let output = Command::new("sh").arg("-c").arg(format!("ls -d {} 2>/dev/null | head -1", pattern))
+        .stdout(Stdio::piped()).stderr(Stdio::null()).output();
     match output {
         Ok(out) => {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -582,24 +568,16 @@ fn search_pattern(pattern: &str) -> Option<String> {
     }
 }
 
-/// Ищет первое USB-устройство через lsblk
 fn find_first_usb_device() -> Option<String> {
-    let output = Command::new("lsblk")
-        .arg("-dpno")
-        .arg("NAME,TRAN")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
+    let output = Command::new("lsblk").arg("-dpno").arg("NAME,TRAN")
+        .stdout(Stdio::piped()).stderr(Stdio::null()).output();
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 if line.contains("usb") {
                     let device = line.split_whitespace().next().unwrap_or("");
-                    if !device.is_empty() {
-                        return Some(device.to_string());
-                    }
+                    if !device.is_empty() { return Some(device.to_string()); }
                 }
             }
             None
@@ -608,45 +586,27 @@ fn find_first_usb_device() -> Option<String> {
     }
 }
 
-/// Монтирует USB-устройство и возвращает точку монтирования
 fn mount_usb_device(device: &str, tx: &mpsc::Sender<LogEvent>) -> Option<String> {
     let mount_point = "/mnt/usb_cert";
     let _ = tx.send(LogEvent::Line(format!("   Монтирую {} в {}...", device, mount_point)));
-
     let _ = Command::new("mkdir").arg("-p").arg(mount_point).status();
 
-    // Пробуем смонтировать первый раздел, затем всё устройство
-    let mount_result = Command::new("mount")
-        .arg(format!("{}1", device))
-        .arg(mount_point)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    let success = match mount_result {
-        Ok(s) => s.success(),
-        Err(_) => false,
-    };
+    let mount_result = Command::new("mount").arg(format!("{}1", device)).arg(mount_point)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let success = match mount_result { Ok(s) => s.success(), Err(_) => false };
 
     if !success {
         let _ = Command::new("umount").arg(mount_point).status();
-        let mount_result = Command::new("mount")
-            .arg(device)
-            .arg(mount_point)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let mount_result = Command::new("mount").arg(device).arg(mount_point)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
         if let Ok(s) = mount_result {
             if !s.success() {
                 let _ = tx.send(LogEvent::Line("   ❌ Не удалось смонтировать устройство".to_string()));
                 return None;
             }
-        } else {
-            return None;
-        }
+        } else { return None; }
     }
 
-    // Проверяем, что файл есть
     let cert_path = Path::new(mount_point).join(CERT_FILE_NAME);
     if cert_path.exists() {
         Some(mount_point.to_string())
@@ -657,25 +617,206 @@ fn mount_usb_device(device: &str, tx: &mpsc::Sender<LogEvent>) -> Option<String>
     }
 }
 
-/// Размонтирует устройство
 fn unmount_device(mount_point: &str, tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line("   Размонтирую флешку...".to_string()));
     let _ = Command::new("umount").arg(mount_point).status();
 }
 
-/// Проверяет, является ли точка монтирования USB
-fn is_mountpoint(path: &str) -> bool {
-    Command::new("mountpoint")
-        .arg("-q")
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+// ==================== УЛУЧШЕНИЕ №8: АВТОНАСТРОЙКА ПРОКСИ ====================
+
+/// Проверяет доступность прокси через curl с таймаутом
+fn test_proxy_connectivity(proxy_url: &str, tx: &mpsc::Sender<LogEvent>) -> bool {
+    let _ = tx.send(LogEvent::Line(format!("   🌐 Проверяю доступность {} через {}...", PROXY_TEST_URL, proxy_url)));
+    log_to_file(&format!("Тест прокси: {} -> {}", proxy_url, PROXY_TEST_URL));
+
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s").arg("-o").arg("/dev/null").arg("-w").arg("%{http_code}")
+        .arg("--max-time").arg(PROXY_TEST_TIMEOUT_SECS.to_string())
+        .arg("--proxy").arg(proxy_url)
+        .arg(PROXY_TEST_URL);
+
+    match cmd.output() {
+        Ok(out) => {
+            let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let success = code == "200" || code == "301" || code == "302";
+            if success {
+                let _ = tx.send(LogEvent::Line(format!("   ✅ Прокси работает (HTTP {})", code)));
+                log_to_file(&format!("Прокси работает: HTTP {}", code));
+            } else {
+                let _ = tx.send(LogEvent::Line(format!("   ⚠ Прокси ответил HTTP {}, возможно недоступен", code)));
+                log_to_file(&format!("Прокси ответил: HTTP {}", code));
+            }
+            success
+        }
+        Err(e) => {
+            let _ = tx.send(LogEvent::Line(format!("   ❌ Не удалось проверить прокси: {}", e)));
+            log_to_file(&format!("Ошибка проверки прокси: {}", e));
+            false
+        }
+    }
 }
 
-// ==================== ШАГ 1: ПРОКСИ ====================
+/// Проверяет, работает ли прокси БЕЗ явного указания (через системные настройки)
+fn test_system_proxy(tx: &mpsc::Sender<LogEvent>) -> bool {
+    let _ = tx.send(LogEvent::Line("   🌐 Проверяю системный прокси...".to_string()));
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s").arg("-o").arg("/dev/null").arg("-w").arg("%{http_code}")
+        .arg("--max-time").arg(PROXY_TEST_TIMEOUT_SECS.to_string())
+        .arg(PROXY_TEST_URL);
+
+    match cmd.output() {
+        Ok(out) => {
+            let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let success = code == "200" || code == "301" || code == "302";
+            if success {
+                let _ = tx.send(LogEvent::Line("   ✅ Системный прокси работает".to_string()));
+            } else {
+                let _ = tx.send(LogEvent::Line(format!("   ⚠ Системный прокси не работает (HTTP {})", code)));
+            }
+            success
+        }
+        Err(_) => false,
+    }
+}
+
+/// Пытается автоматически определить прокси из окружения
+fn detect_proxy_from_env() -> Option<String> {
+    for var in &["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] {
+        if let Ok(val) = env::var(var) {
+            if !val.is_empty() && val.starts_with("http") {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Пытается определить прокси через gsettings (GNOME/ROSA)
+fn detect_proxy_from_gsettings() -> Option<String> {
+    let output = Command::new("gsettings")
+        .arg("get").arg("org.gnome.system.proxy.http").arg("host")
+        .stdout(Stdio::piped()).stderr(Stdio::null()).output();
+    if let Ok(out) = output {
+        let host = String::from_utf8_lossy(&out.stdout).trim().trim_matches('\'').to_string();
+        if !host.is_empty() && host != "''" {
+            let port_output = Command::new("gsettings")
+                .arg("get").arg("org.gnome.system.proxy.http").arg("port")
+                .stdout(Stdio::piped()).stderr(Stdio::null()).output();
+            if let Ok(port_out) = port_output {
+                let port = String::from_utf8_lossy(&port_out.stdout).trim();
+                if !port.is_empty() && port != "0" {
+                    return Some(format!("http://{}:{}", host, port));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Пытается определить прокси через wpad (автоматическое обнаружение)
+fn detect_proxy_from_wpad() -> Option<String> {
+    // Пробуем получить через curl wpad.dat
+    let output = Command::new("curl")
+        .arg("-s").arg("--max-time").arg("3")
+        .arg("http://wpad/wpad.dat")
+        .stdout(Stdio::piped()).stderr(Stdio::null()).output();
+    if let Ok(out) = output {
+        let content = String::from_utf8_lossy(&out.stdout);
+        // Ищем первый PROXY в файле
+        for line in content.lines() {
+            if line.contains("PROXY") {
+                if let Some(start) = line.find("PROXY") {
+                    let rest = &line[start + 5..].trim();
+                    if let Some(end) = rest.find(';') {
+                        return Some(format!("http://{}", rest[..end].trim()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Главная функция автонастройки прокси
+fn auto_setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let _ = tx.send(LogEvent::Line("=== ⚙ Автонастройка прокси ===".to_string()));
+    log_to_file("Запуск автонастройки прокси");
+
+    // 1. Проверяем, уже ли настроен прокси
+    let profile_path = "/etc/profile.d/proxy.sh";
+    let dnf_conf = "/etc/dnf/dnf.conf";
+    let profile_ok = fs::read_to_string(profile_path)
+        .map(|c| c.contains("proxy=")).unwrap_or(false);
+    let dnf_ok = fs::read_to_string(dnf_conf)
+        .map(|c| c.contains("proxy=")).unwrap_or(false);
+
+    if profile_ok && dnf_ok {
+        let current_proxy = get_proxy_url();
+        let _ = tx.send(LogEvent::Line(format!("   ℹ Прокси уже настроен: {}", current_proxy)));
+        if test_proxy_connectivity(&current_proxy, tx) {
+            return (true, format!("Прокси {} уже настроен и работает", current_proxy));
+        }
+        let _ = tx.send(LogEvent::Line("   ⚠ Настроенный прокси не отвечает. Пробую найти другой...".to_string()));
+    }
+
+    // 2. Пробуем системный прокси (без явного указания)
+    if test_system_proxy(tx) {
+        let _ = tx.send(LogEvent::Line("   ✅ Интернет работает через системный прокси".to_string()));
+        // Пытаемся определить URL системного прокси
+        if let Some(proxy) = detect_proxy_from_gsettings() {
+            let _ = tx.send(LogEvent::Line(format!("   ℹ Найден в gsettings: {}", proxy)));
+            if test_proxy_connectivity(&proxy, tx) {
+                // Сохраняем в настройки
+                let _ = save_setting("PROXY_URL", &proxy);
+                let _ = tx.send(LogEvent::Line(format!("   ✅ Сохранён в настройки: {}", proxy)));
+                return (true, format!("Автонастройка: прокси {} найден и сохранён", proxy));
+            }
+        }
+        // Если системный прокси работает, но мы не можем определить URL — оставляем как есть
+        return (true, "Системный прокси работает, настройка не требуется".to_string());
+    }
+
+    // 3. Ищем прокси в переменных окружения
+    if let Some(proxy) = detect_proxy_from_env() {
+        let _ = tx.send(LogEvent::Line(format!("   ℹ Найден в переменных окружения: {}", proxy)));
+        if test_proxy_connectivity(&proxy, tx) {
+            let _ = save_setting("PROXY_URL", &proxy);
+            let _ = tx.send(LogEvent::Line(format!("   ✅ Сохранён в настройки: {}", proxy)));
+            return (true, format!("Автонастройка: прокси {} найден в окружении", proxy));
+        }
+    }
+
+    // 4. Пробуем WPAD
+    if let Some(proxy) = detect_proxy_from_wpad() {
+        let _ = tx.send(LogEvent::Line(format!("   ℹ Найден через WPAD: {}", proxy)));
+        if test_proxy_connectivity(&proxy, tx) {
+            let _ = save_setting("PROXY_URL", &proxy);
+            let _ = tx.send(LogEvent::Line(format!("   ✅ Сохранён в настройки: {}", proxy)));
+            return (true, format!("Автонастройка: прокси {} найден через WPAD", proxy));
+        }
+    }
+
+    // 5. Пробуем дефолтный прокси школы
+    let default_proxy = get_proxy_url();
+    if default_proxy != DEFAULT_PROXY_URL || test_proxy_connectivity(&default_proxy, tx) {
+        if default_proxy != DEFAULT_PROXY_URL {
+            let _ = tx.send(LogEvent::Line(format!("   ℹ Пробую дефолтный прокси школы: {}", default_proxy)));
+        }
+        if test_proxy_connectivity(&default_proxy, tx) {
+            let _ = save_setting("PROXY_URL", &default_proxy);
+            return (true, format!("Автонастройка: прокси {} работает", default_proxy));
+        }
+    }
+
+    // 6. Ничего не找到了 — предлагаем пользователю ввести вручную
+    let _ = tx.send(LogEvent::Line("   ❌ Не удалось автоматически определить прокси".to_string()));
+    let _ = tx.send(LogEvent::Line("   💡 Используйте: sudo ./school-installer --set-proxy <URL>".to_string()));
+    let _ = tx.send(LogEvent::Line("   💡 Или в TUI: выберите пункт '⚙ Автонастройка прокси' и введите URL".to_string()));
+    log_to_file("Автонастройка прокси не удалась");
+    (false, "Не удалось автоматически определить прокси. Укажите вручную.".to_string())
+}
+
+// ==================== ШАГ 1: ПРОКСИ (ручная настройка) ====================
 
 fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let proxy_url = get_proxy_url();
@@ -724,15 +865,19 @@ fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     }
     let _ = tx.send(LogEvent::Line(format!("✅ {} обновлён", conf)));
 
-    (true, "Прокси настроен".to_string())
+    // УЛУЧШЕНИЕ №8: проверяем работоспособность после настройки
+    if test_proxy_connectivity(&proxy_url, tx) {
+        (true, format!("Прокси {} настроен и работает", proxy_url))
+    } else {
+        (true, format!("Прокси {} настроен, но не отвечает (возможно, нет интернета)", proxy_url))
+    }
 }
 
-// ==================== ШАГ 2: СЕРТИФИКАТ (С УЛУЧШЕНИЕМ №7) ====================
+// ==================== ШАГ 2: СЕРТИФИКАТ ====================
 
 fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = tx.send(LogEvent::Line(format!("=== 🔒 Проверка сертификатов из '{}' ===", cert_dir)));
 
-    // Сначала ищем в локальной папке
     let mut certs: Vec<String> = Vec::new();
     if Path::new(cert_dir).exists() {
         if let Ok(entries) = fs::read_dir(cert_dir) {
@@ -754,18 +899,14 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         }
     }
 
-    // УЛУЧШЕНИЕ №7: Если в локальной папке нет сертификата — ищем на USB
     if certs.is_empty() {
         let _ = tx.send(LogEvent::Line("🔍 Сертификат не найден в папке cer/ — ищу на USB-устройствах...".to_string()));
         log_to_file("Поиск сертификата на USB-устройствах...");
 
-        // 1. Ищем на уже смонтированных устройствах
         if let Some(cert_path) = find_cert_on_mounted_devices() {
             let _ = tx.send(LogEvent::Line(format!("   ✅ Найден на смонтированном устройстве: {}", cert_path)));
-            log_to_file(&format!("Найден сертификат: {}", cert_path));
             certs.push(cert_path);
         } else {
-            // 2. Ищем USB-устройства и монтируем
             let _ = tx.send(LogEvent::Line("   На смонтированных устройствах не найден. Ищу USB...".to_string()));
             if let Some(device) = find_first_usb_device() {
                 let _ = tx.send(LogEvent::Line(format!("   Найдено USB-устройство: {}", device)));
@@ -773,10 +914,7 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
                     let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
                     if cert_path.exists() {
                         let _ = tx.send(LogEvent::Line(format!("   ✅ Найден на флешке: {}", cert_path.display())));
-                        log_to_file(&format!("Найден сертификат на USB: {}", cert_path.display()));
                         certs.push(cert_path.to_string_lossy().to_string());
-
-                        // Размонтируем после копирования
                         unmount_device(&mount_point, tx);
                     }
                 }
@@ -888,8 +1026,14 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 }
 
 fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
-    let (ok1, m1) = setup_proxy(tx);
-    if !ok1 { return (false, format!("Прокси: {}", m1)); }
+    // УЛУЧШЕНИЕ №8: сначала пытаемся автонастроить прокси
+    let (auto_ok, auto_msg) = auto_setup_proxy(tx);
+    if !auto_ok {
+        let _ = tx.send(LogEvent::Line(format!("⚠ Автонастройка прокси: {}", auto_msg)));
+        // Пробуем ручную настройку с текущим значением из конфига
+        let (ok2, m2) = setup_proxy(tx);
+        if !ok2 { return (false, format!("Прокси: {}", m2)); }
+    }
     let cert_dir = get_cert_dir();
     let (ok2, m2) = install_cert(&cert_dir, tx);
     if !ok2 { return (false, format!("Сертификат: {}", m2)); }
@@ -1183,7 +1327,19 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
     let system_arch = detect_arch();
 
     let result: (bool, String) = match cmd_id {
-        "setup_env" => prepare_environment(tx),
+        "setup_env" => {
+            // УЛУЧШЕНИЕ №8: сначала автонастройка, потом ручная
+            let (auto_ok, auto_msg) = auto_setup_proxy(tx);
+            if auto_ok {
+                let cert_dir = get_cert_dir();
+                let (ok2, m2) = install_cert(&cert_dir, tx);
+                if !ok2 { (false, format!("Сертификат: {}", m2)) }
+                else { (true, format!("{} | {}", auto_msg, m2)) }
+            } else {
+                prepare_environment(tx)
+            }
+        }
+        "auto_proxy" => auto_setup_proxy(tx),
         "download_updates" => download_updates(&updates_dir, tx),
         "install_updates" => {
             if !Path::new(&updates_dir).exists() { (false, "Папка не найдена. Сначала скачайте обновления.".to_string()) }
@@ -1196,7 +1352,6 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
         }
         "install_cryptopro_gia" => install_cryptopro_gia(&crypto_dir, &download_dir, tx),
         "find_cert" => {
-            // УЛУЧШЕНИЕ №7: Отдельная команда для поиска сертификата
             let _ = tx.send(LogEvent::Line("🔍 Поиск сертификата ca-root.crt...".to_string()));
             if let Some(cert_path) = find_cert_on_mounted_devices() {
                 let _ = tx.send(LogEvent::Line(format!("✅ Найден: {}", cert_path)));
@@ -1255,6 +1410,7 @@ struct CommandItem {
 
 const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
+    CommandItem { id: "auto_proxy", name: "Автонастройка прокси", description: "Автоматически определяет прокси из окружения, gsettings, WPAD и проверяет доступность. УЛУЧШЕНИЕ №8.", icon: "⚙", hotkey: '9' },
     CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' или с USB в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
     CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Автоматически ищет ca-root.crt на всех смонтированных устройствах и USB-флешках. УЛУЧШЕНИЕ №7.", icon: "🔍", hotkey: '8' },
     CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Исключает i686 пакеты. Проверяет свободное место (мин. 1 ГБ).", icon: "⬇", hotkey: '3' },
@@ -1266,7 +1422,7 @@ const COMMANDS: &[CommandItem] = &[
 ];
 
 fn needs_confirmation(cmd_id: &str) -> bool {
-    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia" | "find_cert")
+    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia" | "find_cert" | "auto_proxy")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1320,8 +1476,16 @@ impl App {
     fn select_by_hotkey(&mut self, key: char) {
         if self.is_running || self.pending_command.is_some() { return; }
         match key {
-            '1' => self.selected = 0, '2' => self.selected = 1, '3' => self.selected = 3, '4' => self.selected = 4,
-            '5' => self.selected = 5, '6' => self.selected = 6, '7' => self.selected = 7, '8' => self.selected = 2, '0' => self.selected = 8,
+            '1' => self.selected = 0,
+            '2' => self.selected = 2,
+            '3' => self.selected = 4,
+            '4' => self.selected = 5,
+            '5' => self.selected = 6,
+            '6' => self.selected = 7,
+            '7' => self.selected = 8,
+            '8' => self.selected = 3,
+            '9' => self.selected = 1,
+            '0' => self.selected = 9,
             _ => return,
         }
         self.list_state.select(Some(self.selected));
@@ -1412,9 +1576,9 @@ fn ui(f: &mut Frame, app: &App) {
         ]))
     }).collect();
 
-    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-8=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
+    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-9=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
                      else if app.pending_command.is_some() { " ⚠️ ОЖИДАНИЕ ПОДТВЕРЖДЕНИЯ: Y=да, N=отмена " }
-                     else { " КОМАНДЫ (1-8: выбор, h: помощь, ↑↓, Enter, q) " };
+                     else { " КОМАНДЫ (1-9: выбор, h: помощь, ↑↓, Enter, q) " };
 
     let commands_list = List::new(items).block(Block::default().title(menu_title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
@@ -1425,16 +1589,23 @@ fn ui(f: &mut Frame, app: &App) {
         let help_text = vec![
             Line::from(Span::styled("⌨️  ГОРЯЧИЕ КЛАВИШИ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
             Line::from(""),
-            Line::from("  1 — ℹ Информация и инструкция"), Line::from("  2 — 🌐 Настроить прокси + сертификат"),
-            Line::from("  8 — 🔍 Найти сертификат на USB (NEW!)"),
-            Line::from("  3 — ⬇ Скачать обновления системы"), Line::from("  4 — ⬆ Установить обновления"),
-            Line::from("  5 — 📦 Скачать пакеты"), Line::from("  6 — 🚀 Установить пакеты"),
+            Line::from("  1 — ℹ Информация и инструкция"),
+            Line::from("  9 — ⚙ Автонастройка прокси (NEW!)"),
+            Line::from("  2 — 🌐 Настроить прокси + сертификат"),
+            Line::from("  8 — 🔍 Найти сертификат на USB"),
+            Line::from("  3 — ⬇ Скачать обновления системы"),
+            Line::from("  4 — ⬆ Установить обновления"),
+            Line::from("  5 — 📦 Скачать пакеты"),
+            Line::from("  6 — 🚀 Установить пакеты"),
             Line::from("  7 — 🔐 Установить КриптоПро + ГИА"),
             Line::from("  0 — ✕ Выход"),
             Line::from(""),
-            Line::from("  ↑/k — предыдущий пункт"), Line::from("  ↓/j — следующий пункт"),
-            Line::from("  Enter — выполнить выбранный пункт"), Line::from("  h — показать/скрыть эту справку"),
-            Line::from("  q/Esc — выход"), Line::from("  Ctrl+C — аварийный выход"),
+            Line::from("  ↑/k — предыдущий пункт"),
+            Line::from("  ↓/j — следующий пункт"),
+            Line::from("  Enter — выполнить выбранный пункт"),
+            Line::from("  h — показать/скрыть эту справку"),
+            Line::from("  q/Esc — выход"),
+            Line::from("  Ctrl+C — аварийный выход"),
             Line::from(""),
             Line::from(Span::styled("💡 Совет: нажмите цифру — команда запустится мгновенно!", Style::default().fg(Color::Green))),
         ];
@@ -1545,7 +1716,6 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "find-cert" => {
-                // УЛУЧШЕНИЕ №7: CLI команда для поиска сертификата
                 println!("🔍 Поиск сертификата {}...", CERT_FILE_NAME);
                 if let Some(cert_path) = find_cert_on_mounted_devices() {
                     println!("✅ Найден на смонтированном устройстве: {}", cert_path);
@@ -1566,6 +1736,25 @@ fn main() -> io::Result<()> {
                     }
                 } else {
                     println!("❌ USB-устройства не найдены");
+                }
+                return Ok(());
+            }
+            "auto-proxy" => {
+                // УЛУЧШЕНИЕ №8: CLI режим автонастройки
+                println!("⚙ Запуск автонастройки прокси...");
+                let (tx, rx) = mpsc::channel::<LogEvent>();
+                thread::spawn(move || { run_command("auto_proxy", &tx); });
+                loop {
+                    match rx.recv() {
+                        Ok(LogEvent::Line(s)) => println!("{}", s),
+                        Ok(LogEvent::Progress(p, l)) => println!("[{:>3.0}%] {}", p * 100.0, l),
+                        Ok(LogEvent::Done(ok, msg)) => {
+                            println!("{}", msg);
+                            if !ok { std::process::exit(1); }
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
                 return Ok(());
             }
@@ -1597,7 +1786,7 @@ fn main() -> io::Result<()> {
         let cmd_id = match mode {
             "setup-env" => "setup_env", "download-updates" => "download_updates", "install-updates" => "install_updates",
             "download-packages" => "download_packages", "install-packages" => "install_packages", "install-crypto-gia" => "install_cryptopro_gia",
-            "find-cert" => "find_cert",
+            "find-cert" => "find_cert", "auto-proxy" => "auto_proxy",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
         thread::spawn(move || run_command(&cmd_id, &tx));
@@ -1653,7 +1842,7 @@ fn main() -> io::Result<()> {
                 if let KeyCode::Char(c) = key.code {
                     if !app.is_running {
                         match c {
-                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '0' => { app.select_by_hotkey(c); if c == '0' { break; } continue; }
+                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '0' => { app.select_by_hotkey(c); if c == '0' { break; } continue; }
                             'h' | 'H' | 'р' | 'Р' => { app.toggle_help(); continue; }
                             _ => {}
                         }
