@@ -31,11 +31,11 @@ const DEFAULT_SCHOOL_PACKAGES_DIR: &str = "school_packages";
 const DEFAULT_UPDATES_DIR: &str = "updates";
 
 // ==================== ПОРОГИ СВОБОДНОГО МЕСТА (МБ) ====================
-// УЛУЧШЕНИЕ №2: минимально необходимое свободное место для каждой операции
-const MIN_FREE_SPACE_UPDATES_MB: u64 = 1024;      // 1 ГБ для обновлений
-const MIN_FREE_SPACE_PACKAGES_MB: u64 = 2048;     // 2 ГБ для пакетов (task-koge тянет много)
-const MIN_FREE_SPACE_CRYPTO_MB: u64 = 500;        // 500 МБ для КриптоПро + ГИА
-const MIN_FREE_SPACE_CRITICAL_MB: u64 = 200;      // 200 МБ — абсолютный минимум для работы программы
+
+const MIN_FREE_SPACE_UPDATES_MB: u64 = 1024;
+const MIN_FREE_SPACE_PACKAGES_MB: u64 = 2048;
+const MIN_FREE_SPACE_CRYPTO_MB: u64 = 500;
+const MIN_FREE_SPACE_CRITICAL_MB: u64 = 200;
 
 // ==================== ПРОВЕРКА ПРАВ ROOT (УЛУЧШЕНИЕ №1) ====================
 
@@ -73,8 +73,6 @@ fn require_root_and_exit() -> ! {
 
 // ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА (УЛУЧШЕНИЕ №2) ====================
 
-/// Получает свободное место на диске в МБ для указанного пути
-/// Использует команду `df -BM <path>` и парсит вывод
 fn get_free_space_mb(path: &str) -> Option<u64> {
     let output = Command::new("df")
         .arg("-BM")
@@ -86,14 +84,9 @@ fn get_free_space_mb(path: &str) -> Option<u64> {
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            // Формат df -BM:
-            // Filesystem     1M-blocks  Used Available Use% Mounted on
-            // /dev/sda1         30720    5120     25600  17% /
-            // Берём вторую строку, 4-е поле (Available)
             if let Some(line) = stdout.lines().nth(1) {
                 let fields: Vec<&str> = line.split_whitespace().collect();
                 if fields.len() >= 4 {
-                    // Убираем суффикс "M" если есть
                     let size_str = fields[3].trim_end_matches('M');
                     if let Ok(size) = size_str.parse::<u64>() {
                         return Some(size);
@@ -106,7 +99,6 @@ fn get_free_space_mb(path: &str) -> Option<u64> {
     }
 }
 
-/// Форматирует размер в МБ в читаемый вид (МБ или ГБ)
 fn format_size_mb(mb: u64) -> String {
     if mb >= 1024 {
         format!("{:.1} ГБ", mb as f64 / 1024.0)
@@ -115,14 +107,11 @@ fn format_size_mb(mb: u64) -> String {
     }
 }
 
-/// Проверяет свободное место. Возвращает (ok, сообщение).
-/// Если места меньше min_mb — возвращает false с предупреждением.
-fn check_free_space(path: &str, min_mb: u64, operation_name: &str) -> (bool, String) {
-    // Если путь не существует — проверяем родительский или корень
+fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) -> (bool, String) {
+    let op_name = operation_name.as_ref();
     let check_path = if Path::new(path).exists() {
         path.to_string()
     } else {
-        // Берём существующий родительский каталог
         let mut p = Path::new(path);
         while !p.exists() && p.parent().is_some() {
             p = p.parent().unwrap();
@@ -135,32 +124,29 @@ fn check_free_space(path: &str, min_mb: u64, operation_name: &str) -> (bool, Str
             if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
                 return (false, format!(
                     "❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {} на {}. {} требует минимум {}. Освободите место!",
-                    format_size_mb(free_mb), check_path, operation_name, format_size_mb(min_mb)
+                    format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)
                 ));
             }
             if free_mb < min_mb {
                 return (false, format!(
                     "⚠ Недостаточно места: свободно {} на {}. {} требует минимум {}. Освободите место или выберите другой диск.",
-                    format_size_mb(free_mb), check_path, operation_name, format_size_mb(min_mb)
+                    format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)
                 ));
             }
             (true, format!("✅ Свободно {} на {} (требуется {})", format_size_mb(free_mb), check_path, format_size_mb(min_mb)))
         }
         None => {
-            // Не удалось определить — предупреждаем, но не блокируем
             (true, format!("⚠ Не удалось определить свободное место на {}. Продолжаем с осторожностью.", check_path))
         }
     }
 }
 
-/// Оценивает размер скачивания через `dnf --assumeno` (показывает что будет сделано, но не делает)
-/// Возвращает размер в МБ или None если не удалось определить
 fn estimate_dnf_download_size(args: &[&str]) -> Option<u64> {
     let mut cmd = Command::new("dnf");
     for arg in args {
         cmd.arg(arg);
     }
-    cmd.arg("--assumeno"); // показать план, но не выполнять
+    cmd.arg("--assumeno");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -169,17 +155,11 @@ fn estimate_dnf_download_size(args: &[&str]) -> Option<u64> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
 
-    // Ищем строки вида:
-    // "Total download size: 123 M"  (dnf на английском)
-    // "Объем загрузки: 123 M"       (dnf на русском)
-    // "Total size: 456 M"
     for line in combined.lines() {
         let lower = line.to_lowercase();
         if lower.contains("download size") || lower.contains("объем загрузки") || lower.contains("total size") {
-            // Ищем число перед M/MB/М/МБ
             if let Some(pos) = line.rfind('M') {
                 let before = &line[..pos];
-                // Берём последнее число в строке
                 let parts: Vec<&str> = before.split_whitespace().collect();
                 if let Some(last) = parts.last() {
                     if let Ok(size) = last.parse::<u64>() {
@@ -414,8 +394,7 @@ fn ensure_directories() {
     let cert_dir = get_cert_dir();
 
     let dirs_with_readme: Vec<(String, &str)> = vec![
-        (
-            base_packages.clone(),
+        (base_packages.clone(),
             "📦 ПАКЕТЫ ДЛЯ МОС ОС (ROSA)\n\
              ========================================\n\
              Сюда автоматически скачиваются пакеты для установки.\n\
@@ -429,10 +408,8 @@ fn ensure_directories() {
              1. Запустите на машине с МОС ОС и интернетом:\n\
                 sudo ./school-installer --download-packages\n\
              2. Пакеты автоматически скачаются в эту папку\n\
-             3. Скопируйте папку school_packages/ на флешку"
-        ),
-        (
-            base_updates.clone(),
+             3. Скопируйте папку school_packages/ на флешку"),
+        (base_updates.clone(),
             "🔄 ОБНОВЛЕНИЯ ДЛЯ МОС ОС (ROSA)\n\
              ========================================\n\
              Сюда автоматически скачиваются обновления системы.\n\
@@ -441,10 +418,8 @@ fn ensure_directories() {
              sudo ./school-installer --download-updates\n\
              \n\
              Установка в классе:\n\
-             sudo ./school-installer --install-updates"
-        ),
-        (
-            format!("{}/linux-amd64", crypto_dir),
+             sudo ./school-installer --install-updates"),
+        (format!("{}/linux-amd64", crypto_dir),
             "🔐 КРИПТОПРО CSP — ДИСТРИБУТИВ\n\
              ========================================\n\
              Сюда положите дистрибутив КриптоПро CSP.\n\
@@ -464,10 +439,8 @@ fn ensure_directories() {
              ВАЖНО: install.sh сам выберет правильный менеджер пакетов.\n\
              \n\
              Конфигурация: kc1 (по умолчанию) — для экзаменов.\n\
-             kc2 используйте только если точно знаете, зачем."
-        ),
-        (
-            crypto_dir.clone(),
+             kc2 используйте только если точно знаете, зачем."),
+        (crypto_dir.clone(),
             "🔑 КРИПТОПРО + ГИА — ДОПОЛНИТЕЛЬНЫЕ ПАКЕТЫ\n\
              ========================================\n\
              Корень папки cryptopro_gia/ — сюда кладите:\n\
@@ -485,10 +458,8 @@ fn ensure_directories() {
                 — платформа проведения экзамена (ОБЯЗАТЕЛЬНО)\n\
              \n\
              Если какого-то пакета нет — программа скачает его\n\
-             из репозитория (нужен интернет через прокси)."
-        ),
-        (
-            cert_dir,
+             из репозитория (нужен интернет через прокси)."),
+        (cert_dir,
             "🔒 СЕРТИФИКАТЫ\n\
              ========================================\n\
              Сюда положите корневые сертификаты (.crt, .pem, .cer)\n\
@@ -501,8 +472,7 @@ fn ensure_directories() {
              2. В NSS-базу Chromium (для браузера)\n\
              \n\
              ВАЖНО: не кладите файлы, начинающиеся с ._ (это\n\
-             macOS-артефакты, они не являются сертификатами)."
-        ),
+             macOS-артефакты, они не являются сертификатами)."),
     ];
 
     for (dir, readme_content) in &dirs_with_readme {
@@ -527,7 +497,6 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line(format!("🖥 ОС: МОС ОС (ROSA) | Архитектура: {}", detect_arch())));
     let _ = tx.send(LogEvent::Line(String::new()));
 
-    // Показываем свободное место на диске
     if let Some(free_mb) = get_free_space_mb(&base_packages) {
         let _ = tx.send(LogEvent::Line(format!("💾 Свободно на диске: {}", format_size_mb(free_mb))));
         let _ = tx.send(LogEvent::Line(String::new()));
@@ -813,14 +782,12 @@ fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
 
-    // УЛУЧШЕНИЕ №2: проверяем свободное место
     let (space_ok, space_msg) = check_free_space(download_dir, MIN_FREE_SPACE_UPDATES_MB, "Скачивание обновлений");
-    let _ = tx.send(LogEvent::Line(space_msg));
+    let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok {
         return (false, space_msg);
     }
 
-    // Пытаемся оценить размер скачивания
     let estimated_size = estimate_dnf_download_size(&[
         "upgrade", "--downloadonly",
         "--exclude=*.i686", "--exclude=*.i586", "--exclude=*.i386",
@@ -831,7 +798,6 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
             let (enough, msg) = check_free_space(download_dir, size_mb + 100, "Скачивание обновлений (с запасом 100 МБ)");
             if !enough {
                 let _ = tx.send(LogEvent::Line(msg));
-                // Не блокируем, только предупреждаем — пользователь может подтвердить
             } else {
                 let _ = tx.send(LogEvent::Line(msg));
             }
@@ -868,14 +834,12 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
 fn download_packages(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
 
-    // УЛУЧШЕНИЕ №2: проверяем свободное место
     let (space_ok, space_msg) = check_free_space(download_dir, MIN_FREE_SPACE_PACKAGES_MB, "Скачивание пакетов");
-    let _ = tx.send(LogEvent::Line(space_msg));
+    let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok {
         return (false, space_msg);
     }
 
-    // Оцениваем размер
     let mut dnf_args: Vec<String> = vec![
         "download".to_string(), "--resolve".to_string(), "--alldeps".to_string(),
         "--exclude=*.i686".to_string(), "--exclude=*.i586".to_string(), "--exclude=*.i386".to_string(),
@@ -915,15 +879,13 @@ fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool
     }
     let _ = tx.send(LogEvent::Line(format!("Найдено {} пакетов для установки", files.len())));
 
-    // УЛУЧШЕНИЕ №2: проверяем место для установки (распакованные пакеты занимают больше)
     let total_size_bytes: u64 = files.iter()
         .filter_map(|f| fs::metadata(f).ok().map(|m| m.len()))
         .sum();
     let total_size_mb = total_size_bytes / (1024 * 1024);
-    // При установке нужно примерно в 3 раза больше места (распаковка + кэш)
     let required_mb = total_size_mb * 3;
     let (space_ok, space_msg) = check_free_space(download_dir, required_mb.max(MIN_FREE_SPACE_CRITICAL_MB), "Установка пакетов");
-    let _ = tx.send(LogEvent::Line(space_msg));
+    let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok {
         return (false, format!("{} Размер пакетов: {}, для установки нужно ~{}", space_msg, format_size_mb(total_size_mb), format_size_mb(required_mb)));
     }
@@ -951,9 +913,8 @@ fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool
 fn download_package_to_folder(package_name: &str, folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(folder);
 
-    // УЛУЧШЕНИЕ №2: проверяем место перед скачиванием отдельного пакета
     let (space_ok, space_msg) = check_free_space(folder, 100, format!("Скачивание {}", package_name));
-    let _ = tx.send(LogEvent::Line(space_msg));
+    let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok {
         return (false, space_msg);
     }
@@ -996,14 +957,13 @@ fn install_local_packages(folder: &str, pattern: &str, tx: &mpsc::Sender<LogEven
     let files = find_packages_by_substring(folder, pattern, &detect_arch());
     if files.is_empty() { return (false, format!("❌ Не найдено *{}*.rpm в папке {}", pattern, folder)); }
 
-    // УЛУЧШЕНИЕ №2: проверяем место перед установкой
     let total_size_bytes: u64 = files.iter()
         .filter_map(|f| fs::metadata(f).ok().map(|m| m.len()))
         .sum();
     let total_size_mb = total_size_bytes / (1024 * 1024);
     let required_mb = total_size_mb * 3;
     let (space_ok, space_msg) = check_free_space(folder, required_mb.max(100), format!("Установка {}", pattern));
-    let _ = tx.send(LogEvent::Line(space_msg));
+    let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok {
         return (false, space_msg);
     }
@@ -1025,9 +985,8 @@ fn install_cryptopro_csp(crypto_subdir: &str, tx: &mpsc::Sender<LogEvent>) -> (b
     if !install_script.exists() { return (false, "❌ В linux-amd64/ не найден install.sh КриптоПро".to_string()); }
     if !uninstall_script.exists() { return (false, "❌ В linux-amd64/ не найден uninstall.sh КриптоПро".to_string()); }
 
-    // УЛУЧШЕНИЕ №2: проверяем место перед установкой КриптоПро (~300 МБ)
     let (space_ok, space_msg) = check_free_space(crypto_subdir, MIN_FREE_SPACE_CRYPTO_MB, "Установка КриптоПро CSP");
-    let _ = tx.send(LogEvent::Line(space_msg));
+    let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok {
         return (false, space_msg);
     }
@@ -1047,9 +1006,8 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
     let _ = fs::create_dir_all(school_dir);
     let system_arch = detect_arch();
 
-    // УЛУЧШЕНИЕ №2: общая проверка места перед всем процессом
     let (space_ok, space_msg) = check_free_space(crypto_dir, MIN_FREE_SPACE_CRYPTO_MB, "Установка КриптоПро + ГИА");
-    let _ = tx.send(LogEvent::Line(space_msg));
+    let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok {
         return (false, space_msg);
     }
@@ -1141,7 +1099,6 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
 
     ensure_directories();
 
-    // УЛУЧШЕНИЕ №2: общая проверка места при запуске программы
     if let Some(free_mb) = get_free_space_mb(&pkg_dir) {
         if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
             let _ = tx.send(LogEvent::Line(format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {} на диске. Программа может работать нестабильно.", format_size_mb(free_mb))));
@@ -1207,17 +1164,20 @@ struct CommandItem {
     name: &'static str,
     description: &'static str,
     icon: &'static str,
+    hotkey: char,  // УЛУЧШЕНИЕ №3: горячая клавиша
 }
 
+// ⚠ ВАЖНО: эмодзи только в поле icon, в name их нет — иначе в меню будет дублирование
+// УЛУЧШЕНИЕ №3: добавлено поле hotkey для каждой команды
 const COMMANDS: &[CommandItem] = &[
-    CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, свободное место и инструкцию по подготовке флешки.", icon: "ℹ" },
-    CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' в системное хранилище и NSS Chromium.", icon: "🌐" },
-    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Исключает i686 пакеты. Проверяет свободное место (мин. 1 ГБ).", icon: "⬇" },
-    CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ офлайн. Проверяет свободное место перед установкой.", icon: "⬆" },
-    CommandItem { id: "download_packages", name: "Скачать пакеты", description: "Скачивает task-koge + r7-office + notepadqq. Проверяет свободное место (мин. 2 ГБ).", icon: "📦" },
-    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ офлайн. Проверяет свободное место.", icon: "🚀" },
-    CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "5 шагов: newt → pcsc-lite → librtpkcs11ecp → КриптоПро → GIA11_PPE → pcscd. Проверяет свободное место (мин. 500 МБ).", icon: "🔐" },
-    CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕" },
+    CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
+    CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
+    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Исключает i686 пакеты. Проверяет свободное место (мин. 1 ГБ).", icon: "⬇", hotkey: '3' },
+    CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ офлайн. Проверяет свободное место перед установкой.", icon: "⬆", hotkey: '4' },
+    CommandItem { id: "download_packages", name: "Скачать пакеты", description: "Скачивает task-koge + r7-office + notepadqq. Проверяет свободное место (мин. 2 ГБ).", icon: "📦", hotkey: '5' },
+    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ офлайн. Проверяет свободное место.", icon: "🚀", hotkey: '6' },
+    CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "5 шагов: newt → pcsc-lite → librtpkcs11ecp → КриптоПро → GIA11_PPE → pcscd. Проверяет свободное место (мин. 500 МБ).", icon: "🔐", hotkey: '7' },
+    CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕", hotkey: '0' },
 ];
 
 struct App {
@@ -1231,6 +1191,7 @@ struct App {
     log_lines: Vec<String>,
     log_rx: Option<mpsc::Receiver<LogEvent>>,
     first_run_shown: bool,
+    show_help: bool,  // УЛУЧШЕНИЕ №3: флаг показа справки по горячим клавишам
 }
 
 impl App {
@@ -1247,6 +1208,7 @@ impl App {
             progress: 0.0, progress_label: String::new(),
             log_lines: Vec::new(), log_rx: None,
             first_run_shown: false,
+            show_help: false,
         }
     }
     fn next(&mut self) {
@@ -1259,6 +1221,28 @@ impl App {
         self.selected = if self.selected == 0 { COMMANDS.len() - 1 } else { self.selected - 1 };
         self.list_state.select(Some(self.selected));
     }
+    // УЛУЧШЕНИЕ №3: выбор команды по номеру (1-8, 0 = выход)
+    fn select_by_hotkey(&mut self, key: char) {
+        if self.is_running { return; }
+        match key {
+            '1' => self.selected = 0,
+            '2' => self.selected = 1,
+            '3' => self.selected = 2,
+            '4' => self.selected = 3,
+            '5' => self.selected = 4,
+            '6' => self.selected = 5,
+            '7' => self.selected = 6,
+            '0' => self.selected = 7,  // Выход
+            _ => return,
+        }
+        self.list_state.select(Some(self.selected));
+        // Автоматически выполняем выбранную команду
+        if COMMANDS[self.selected].id == "exit" {
+            // Выход обрабатывается в основном цикле
+            return;
+        }
+        self.execute_selected();
+    }
     fn execute_selected(&mut self) {
         if self.is_running { return; }
         let cmd = COMMANDS[self.selected].clone();
@@ -1267,9 +1251,14 @@ impl App {
         self.progress_label = format!("Выполняю: {}...", cmd.name);
         self.status = format!("▶ {}", cmd.name);
         self.log_lines.clear();
+        self.show_help = false;  // Скрываем справку при запуске команды
         let (tx, rx) = mpsc::channel::<LogEvent>();
         thread::spawn(move || { run_command(cmd.id, &tx); });
         self.log_rx = Some(rx);
+    }
+    fn toggle_help(&mut self) {
+        if self.is_running { return; }
+        self.show_help = !self.show_help;
     }
     fn poll_events(&mut self) {
         let mut rx = self.log_rx.take();
@@ -1315,6 +1304,7 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[1]);
 
+    // УЛУЧШЕНИЕ №3: в меню показываем номер + иконка + имя
     let items: Vec<ListItem> = COMMANDS.iter().enumerate().map(|(i, cmd)| {
         let style = if i == app.selected {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -1323,14 +1313,24 @@ fn ui(f: &mut Frame, app: &App) {
         } else {
             Style::default().fg(Color::White)
         };
+        // Формат: "1 ℹ Информация и инструкция"
+        let hotkey_str = if cmd.hotkey == '0' { "0".to_string() } else { format!("{}", cmd.hotkey) };
         ListItem::new(Line::from(vec![
+            Span::styled(format!("{} ", hotkey_str), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" {} ", cmd.icon), style),
             Span::styled(cmd.name, style),
         ]))
     }).collect();
 
+    // УЛУЧШЕНИЕ №3: в заголовке меню показываем подсказку по горячим клавишам
+    let menu_title = if app.show_help {
+        " ГОРЯЧИЕ КЛАВИШИ: 1-8=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход "
+    } else {
+        " КОМАНДЫ (1-8: выбор, h: помощь, ↑↓, Enter, q) "
+    };
+
     let commands_list = List::new(items)
-        .block(Block::default().title(" КОМАНДЫ (стрелки, Enter, q) ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
+        .block(Block::default().title(menu_title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
         .highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
 
@@ -1339,18 +1339,47 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Length(8), Constraint::Min(0)])
         .split(main_chunks[1]);
 
-    let selected_cmd = &COMMANDS[app.selected];
-    let desc = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Команда: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(selected_cmd.name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(""),
-        Line::from(selected_cmd.description),
-    ])
-    .block(Block::default().title(" ОПИСАНИЕ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-    .wrap(Wrap { trim: false });
-    f.render_widget(desc, right_chunks[0]);
+    // УЛУЧШЕНИЕ №3: если show_help=true — показываем справку вместо описания
+    if app.show_help {
+        let help_text = vec![
+            Line::from(Span::styled("⌨️  ГОРЯЧИЕ КЛАВИШИ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from("  1 — ℹ Информация и инструкция"),
+            Line::from("  2 — 🌐 Настроить прокси + сертификат"),
+            Line::from("  3 — ⬇ Скачать обновления системы"),
+            Line::from("  4 — ⬆ Установить обновления"),
+            Line::from("  5 — 📦 Скачать пакеты"),
+            Line::from("  6 — 🚀 Установить пакеты"),
+            Line::from("  7 — 🔐 Установить КриптоПро + ГИА"),
+            Line::from("  0 — ✕ Выход"),
+            Line::from(""),
+            Line::from("  ↑/k — предыдущий пункт"),
+            Line::from("  ↓/j — следующий пункт"),
+            Line::from("  Enter — выполнить выбранный пункт"),
+            Line::from("  h — показать/скрыть эту справку"),
+            Line::from("  q/Esc — выход"),
+            Line::from("  Ctrl+C — аварийный выход"),
+            Line::from(""),
+            Line::from(Span::styled("💡 Совет: нажмите цифру — команда запустится мгновенно!", Style::default().fg(Color::Green))),
+        ];
+        let help_widget = Paragraph::new(help_text)
+            .block(Block::default().title(" СПРАВКА ПО ГОРЯЧИМ КЛАВИШАМ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)))
+            .wrap(Wrap { trim: false });
+        f.render_widget(help_widget, right_chunks[0]);
+    } else {
+        let selected_cmd = &COMMANDS[app.selected];
+        let desc = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Команда: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("[{}] {}", selected_cmd.hotkey, selected_cmd.name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(selected_cmd.description),
+        ])
+        .block(Block::default().title(" ОПИСАНИЕ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
+        .wrap(Wrap { trim: false });
+        f.render_widget(desc, right_chunks[0]);
+    }
 
     let height = right_chunks[1].height.saturating_sub(2) as usize;
     let start = app.log_lines.len().saturating_sub(height);
@@ -1498,6 +1527,26 @@ fn main() -> io::Result<()> {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { break; }
+                
+                // УЛУЧШЕНИЕ №3: обработка горячих клавиш 0-9
+                if let KeyCode::Char(c) = key.code {
+                    if !app.is_running {
+                        match c {
+                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '0' => {
+                                app.select_by_hotkey(c);
+                                // Если выбрали выход — прерываем цикл
+                                if c == '0' { break; }
+                                continue;
+                            }
+                            'h' | 'H' | 'р' | 'Р' => {  // 'h' и русская 'р' (одна клавиша)
+                                app.toggle_help();
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
