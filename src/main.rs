@@ -132,6 +132,26 @@ fn format_size_mb(mb: u64) -> String {
     if mb >= 1024 { format!("{:.1} ГБ", mb as f64 / 1024.0) } else { format!("{} МБ", mb) }
 }
 
+// УЛУЧШЕНИЕ №9: форматирование байт в читаемый вид
+fn format_size_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
+
+    if bytes >= TB {
+        format!("{:.1} ТБ", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.1} ГБ", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.0} МБ", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} КБ", bytes as f64 / KB as f64)
+    } else {
+        format!("{} Б", bytes)
+    }
+}
+
 fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) -> (bool, String) {
     let op_name = operation_name.as_ref();
     let check_path = if Path::new(path).exists() {
@@ -437,17 +457,29 @@ fn ensure_directories() {
     }
 }
 
+// УЛУЧШЕНИЕ №9: форматированная информация о папке (существование + размер + количество rpm)
+fn folder_info_line(prefix: &str, path: &str, system_arch: &str) -> String {
+    let exists = Path::new(path).exists();
+    if !exists {
+        return format!("   {} {} (не существует)", prefix, path);
+    }
+    let size_bytes = get_folder_size(path);
+    let rpm_count = find_packages_flat(path, "", system_arch).len();
+    format!("   {} {} ({} .rpm, {})", prefix, path, rpm_count, format_size_bytes(size_bytes))
+}
+
 fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
     let base_packages = get_school_packages_dir();
     let base_updates = get_updates_dir();
     let crypto_dir = get_crypto_dir();
     let cert_dir = get_cert_dir();
+    let system_arch = detect_arch();
 
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
     let _ = tx.send(LogEvent::Line("  📋 ИНСТРУКЦИЯ ПО ПОДГОТОВКЕ ФЛЕШКИ".to_string()));
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
-    let _ = tx.send(LogEvent::Line(format!("🖥 ОС: МОС ОС (ROSA) | Архитектура: {}", detect_arch())));
+    let _ = tx.send(LogEvent::Line(format!("🖥 ОС: МОС ОС (ROSA) | Архитектура: {}", system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     if let Some(free_mb) = get_free_space_mb(&base_packages) {
@@ -455,19 +487,23 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
         let _ = tx.send(LogEvent::Line(String::new()));
     }
 
+    // УЛУЧШЕНИЕ №9: показываем размер папок
     let _ = tx.send(LogEvent::Line("📦 1. school_packages/ — пакеты для установки".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   ├── task-koge, r7-office, notepadqq ({})", Path::new(&base_packages).exists())));
+    let _ = tx.send(LogEvent::Line(folder_info_line("├──", &base_packages, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("🔄 2. updates/ — обновления системы".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   ├── обновления МОС ОС ({})", Path::new(&base_updates).exists())));
+    let _ = tx.send(LogEvent::Line(folder_info_line("├──", &base_updates, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("🔐 3. cryptopro_gia/ — КриптоПро + ГИА".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   ├── linux-amd64/  — дистрибутив КриптоПро ({})", Path::new(&format!("{}/linux-amd64", crypto_dir)).exists())));
-    let _ = tx.send(LogEvent::Line("   │   ├── install.sh        (ОБЯЗАТЕЛЬНО)".to_string()));
-    let _ = tx.send(LogEvent::Line("   │   ├── uninstall.sh      (ОБЯЗАТЕЛЬНО)".to_string()));
-    let _ = tx.send(LogEvent::Line("   │   └── *.rpm             (все из архива КриптоПро)".to_string()));
+    let _ = tx.send(LogEvent::Line(folder_info_line("├──", &crypto_dir, &system_arch)));
+    let crypto_subdir = format!("{}/linux-amd64", crypto_dir);
+    if Path::new(&crypto_subdir).exists() {
+        let _ = tx.send(LogEvent::Line("   │   ├── install.sh        (ОБЯЗАТЕЛЬНО)".to_string()));
+        let _ = tx.send(LogEvent::Line("   │   ├── uninstall.sh      (ОБЯЗАТЕЛЬНО)".to_string()));
+        let _ = tx.send(LogEvent::Line("   │   └── *.rpm             (все из архива КриптоПро)".to_string()));
+    }
     let _ = tx.send(LogEvent::Line("   ├── newt-*.rpm            (нужен для install.sh)".to_string()));
     let _ = tx.send(LogEvent::Line("   ├── pcsc-lite-*.rpm       (демон смарт-карт)".to_string()));
     let _ = tx.send(LogEvent::Line("   ├── librtpkcs11ecp-*.rpm  (токены Рутокен/Jacarta)".to_string()));
@@ -475,7 +511,7 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("🔒 4. cer/ — корневые сертификаты".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   └── ca-root.crt     ({})", Path::new(&cert_dir).exists())));
+    let _ = tx.send(LogEvent::Line(folder_info_line("└──", &cert_dir, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
@@ -624,7 +660,6 @@ fn unmount_device(mount_point: &str, tx: &mpsc::Sender<LogEvent>) {
 
 // ==================== УЛУЧШЕНИЕ №8: АВТОНАСТРОЙКА ПРОКСИ ====================
 
-/// Проверяет доступность прокси через curl с таймаутом
 fn test_proxy_connectivity(proxy_url: &str, tx: &mpsc::Sender<LogEvent>) -> bool {
     let _ = tx.send(LogEvent::Line(format!("   🌐 Проверяю доступность {} через {}...", PROXY_TEST_URL, proxy_url)));
     log_to_file(&format!("Тест прокси: {} -> {}", proxy_url, PROXY_TEST_URL));
@@ -656,7 +691,6 @@ fn test_proxy_connectivity(proxy_url: &str, tx: &mpsc::Sender<LogEvent>) -> bool
     }
 }
 
-/// Проверяет, работает ли прокси БЕЗ явного указания (через системные настройки)
 fn test_system_proxy(tx: &mpsc::Sender<LogEvent>) -> bool {
     let _ = tx.send(LogEvent::Line("   🌐 Проверяю системный прокси...".to_string()));
     let mut cmd = Command::new("curl");
@@ -679,7 +713,6 @@ fn test_system_proxy(tx: &mpsc::Sender<LogEvent>) -> bool {
     }
 }
 
-/// Пытается автоматически определить прокси из окружения
 fn detect_proxy_from_env() -> Option<String> {
     for var in &["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] {
         if let Ok(val) = env::var(var) {
@@ -691,7 +724,6 @@ fn detect_proxy_from_env() -> Option<String> {
     None
 }
 
-/// Пытается определить прокси через gsettings (GNOME/ROSA)
 fn detect_proxy_from_gsettings() -> Option<String> {
     let output = Command::new("gsettings")
         .arg("get").arg("org.gnome.system.proxy.http").arg("host")
@@ -713,16 +745,13 @@ fn detect_proxy_from_gsettings() -> Option<String> {
     None
 }
 
-/// Пытается определить прокси через wpad (автоматическое обнаружение)
 fn detect_proxy_from_wpad() -> Option<String> {
-    // Пробуем получить через curl wpad.dat
     let output = Command::new("curl")
         .arg("-s").arg("--max-time").arg("3")
         .arg("http://wpad/wpad.dat")
         .stdout(Stdio::piped()).stderr(Stdio::null()).output();
     if let Ok(out) = output {
         let content = String::from_utf8_lossy(&out.stdout);
-        // Ищем первый PROXY в файле
         for line in content.lines() {
             if line.contains("PROXY") {
                 if let Some(start) = line.find("PROXY") {
@@ -737,12 +766,10 @@ fn detect_proxy_from_wpad() -> Option<String> {
     None
 }
 
-/// Главная функция автонастройки прокси
 fn auto_setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = tx.send(LogEvent::Line("=== ⚙ Автонастройка прокси ===".to_string()));
     log_to_file("Запуск автонастройки прокси");
 
-    // 1. Проверяем, уже ли настроен прокси
     let profile_path = "/etc/profile.d/proxy.sh";
     let dnf_conf = "/etc/dnf/dnf.conf";
     let profile_ok = fs::read_to_string(profile_path)
@@ -759,24 +786,19 @@ fn auto_setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         let _ = tx.send(LogEvent::Line("   ⚠ Настроенный прокси не отвечает. Пробую найти другой...".to_string()));
     }
 
-    // 2. Пробуем системный прокси (без явного указания)
     if test_system_proxy(tx) {
         let _ = tx.send(LogEvent::Line("   ✅ Интернет работает через системный прокси".to_string()));
-        // Пытаемся определить URL системного прокси
         if let Some(proxy) = detect_proxy_from_gsettings() {
             let _ = tx.send(LogEvent::Line(format!("   ℹ Найден в gsettings: {}", proxy)));
             if test_proxy_connectivity(&proxy, tx) {
-                // Сохраняем в настройки
                 let _ = save_setting("PROXY_URL", &proxy);
                 let _ = tx.send(LogEvent::Line(format!("   ✅ Сохранён в настройки: {}", proxy)));
                 return (true, format!("Автонастройка: прокси {} найден и сохранён", proxy));
             }
         }
-        // Если системный прокси работает, но мы не можем определить URL — оставляем как есть
         return (true, "Системный прокси работает, настройка не требуется".to_string());
     }
 
-    // 3. Ищем прокси в переменных окружения
     if let Some(proxy) = detect_proxy_from_env() {
         let _ = tx.send(LogEvent::Line(format!("   ℹ Найден в переменных окружения: {}", proxy)));
         if test_proxy_connectivity(&proxy, tx) {
@@ -786,7 +808,6 @@ fn auto_setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         }
     }
 
-    // 4. Пробуем WPAD
     if let Some(proxy) = detect_proxy_from_wpad() {
         let _ = tx.send(LogEvent::Line(format!("   ℹ Найден через WPAD: {}", proxy)));
         if test_proxy_connectivity(&proxy, tx) {
@@ -796,7 +817,6 @@ fn auto_setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         }
     }
 
-    // 5. Пробуем дефолтный прокси школы
     let default_proxy = get_proxy_url();
     if default_proxy != DEFAULT_PROXY_URL || test_proxy_connectivity(&default_proxy, tx) {
         if default_proxy != DEFAULT_PROXY_URL {
@@ -808,15 +828,13 @@ fn auto_setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         }
     }
 
-    // 6. Ничего не找到了 — предлагаем пользователю ввести вручную
     let _ = tx.send(LogEvent::Line("   ❌ Не удалось автоматически определить прокси".to_string()));
     let _ = tx.send(LogEvent::Line("   💡 Используйте: sudo ./school-installer --set-proxy <URL>".to_string()));
-    let _ = tx.send(LogEvent::Line("   💡 Или в TUI: выберите пункт '⚙ Автонастройка прокси' и введите URL".to_string()));
     log_to_file("Автонастройка прокси не удалась");
     (false, "Не удалось автоматически определить прокси. Укажите вручную.".to_string())
 }
 
-// ==================== ШАГ 1: ПРОКСИ (ручная настройка) ====================
+// ==================== ШАГ 1: ПРОКСИ ====================
 
 fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let proxy_url = get_proxy_url();
@@ -865,7 +883,6 @@ fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     }
     let _ = tx.send(LogEvent::Line(format!("✅ {} обновлён", conf)));
 
-    // УЛУЧШЕНИЕ №8: проверяем работоспособность после настройки
     if test_proxy_connectivity(&proxy_url, tx) {
         (true, format!("Прокси {} настроен и работает", proxy_url))
     } else {
@@ -1026,11 +1043,9 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 }
 
 fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
-    // УЛУЧШЕНИЕ №8: сначала пытаемся автонастроить прокси
     let (auto_ok, auto_msg) = auto_setup_proxy(tx);
     if !auto_ok {
         let _ = tx.send(LogEvent::Line(format!("⚠ Автонастройка прокси: {}", auto_msg)));
-        // Пробуем ручную настройку с текущим значением из конфига
         let (ok2, m2) = setup_proxy(tx);
         if !ok2 { return (false, format!("Прокси: {}", m2)); }
     }
@@ -1328,7 +1343,6 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
 
     let result: (bool, String) = match cmd_id {
         "setup_env" => {
-            // УЛУЧШЕНИЕ №8: сначала автонастройка, потом ручная
             let (auto_ok, auto_msg) = auto_setup_proxy(tx);
             if auto_ok {
                 let cert_dir = get_cert_dir();
@@ -1377,13 +1391,15 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
         }
         "detect_os" => {
             print_setup_instructions(tx);
+            // УЛУЧШЕНИЕ №9: подробная информация с размерами
             let mut info = format!("🖥 ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
             info += &format!("\n  🌐 Прокси: {}", get_proxy_url());
-            info += &format!("\n  🔒 cer: {}", cert_dir);
-            info += &format!("\n  📦 school_packages: {} ({} .rpm)", Path::new(&download_dir).exists(), find_packages_flat(&download_dir, "", &system_arch).len());
-            info += &format!("\n  🔄 updates: {} ({} .rpm)", Path::new(&updates_dir).exists(), find_packages_flat(&updates_dir, "", &system_arch).len());
-            info += &format!("\n  🔐 cryptopro_gia/linux-amd64/install.sh: {}", Path::new(&format!("{}/linux-amd64/install.sh", crypto_dir)).exists());
-            info += &format!("\n  .rpm в cryptopro_gia/: {}", find_packages_flat(&crypto_dir, "", &system_arch).len());
+            info += &format!("\n  🔒 cer: {}", folder_info_line("", &cert_dir, &system_arch));
+            info += &format!("\n  📦 school_packages: {}", folder_info_line("", &download_dir, &system_arch));
+            info += &format!("\n  🔄 updates: {}", folder_info_line("", &updates_dir, &system_arch));
+            info += &format!("\n  🔐 cryptopro_gia: {}", folder_info_line("", &crypto_dir, &system_arch));
+            let install_sh = format!("{}/linux-amd64/install.sh", crypto_dir);
+            info += &format!("\n     └── install.sh: {}", Path::new(&install_sh).exists());
             if let Some(free_mb) = get_free_space_mb(&download_dir) {
                 info += &format!("\n  💾 Свободно на диске: {}", format_size_mb(free_mb));
             }
@@ -1409,7 +1425,7 @@ struct CommandItem {
 }
 
 const COMMANDS: &[CommandItem] = &[
-    CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
+    CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, размеры, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
     CommandItem { id: "auto_proxy", name: "Автонастройка прокси", description: "Автоматически определяет прокси из окружения, gsettings, WPAD и проверяет доступность. УЛУЧШЕНИЕ №8.", icon: "⚙", hotkey: '9' },
     CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' или с USB в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
     CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Автоматически ищет ca-root.crt на всех смонтированных устройствах и USB-флешках. УЛУЧШЕНИЕ №7.", icon: "🔍", hotkey: '8' },
@@ -1590,7 +1606,7 @@ fn ui(f: &mut Frame, app: &App) {
             Line::from(Span::styled("⌨️  ГОРЯЧИЕ КЛАВИШИ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from("  1 — ℹ Информация и инструкция"),
-            Line::from("  9 — ⚙ Автонастройка прокси (NEW!)"),
+            Line::from("  9 — ⚙ Автонастройка прокси"),
             Line::from("  2 — 🌐 Настроить прокси + сертификат"),
             Line::from("  8 — 🔍 Найти сертификат на USB"),
             Line::from("  3 — ⬇ Скачать обновления системы"),
@@ -1740,7 +1756,6 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "auto-proxy" => {
-                // УЛУЧШЕНИЕ №8: CLI режим автонастройки
                 println!("⚙ Запуск автонастройки прокси...");
                 let (tx, rx) = mpsc::channel::<LogEvent>();
                 thread::spawn(move || { run_command("auto_proxy", &tx); });
@@ -1768,6 +1783,13 @@ fn main() -> io::Result<()> {
                 println!("Папка обновлений: {}", get_updates_dir());
                 if let Some(free_mb) = get_free_space_mb(".") { println!("💾 Свободно на диске: {}", format_size_mb(free_mb)); }
                 println!("\n📝 Лог: {}", log_file_path());
+                // УЛУЧШЕНИЕ №9: размеры папок
+                let system_arch = detect_arch();
+                println!("\n📊 Размеры папок:");
+                println!("  school_packages: {}", folder_info_line("", &get_school_packages_dir(), &system_arch));
+                println!("  updates: {}", folder_info_line("", &get_updates_dir(), &system_arch));
+                println!("  cryptopro_gia: {}", folder_info_line("", &get_crypto_dir(), &system_arch));
+                println!("  cer: {}", folder_info_line("", &get_cert_dir(), &system_arch));
                 return Ok(());
             }
             "reset-settings" => {
