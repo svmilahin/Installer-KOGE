@@ -86,7 +86,7 @@ fn log_session_start() {
     log_to_file(&format!("Прокси: {}", get_proxy_url()));
 }
 
-// ==================== ПРОВЕРКА ПРАВ ROOT ====================
+// ==================== ПРОВЕРКА ПРАВ ROOT (УЛУЧШЕНИЕ №1) ====================
 
 fn check_root() -> bool {
     let output = Command::new("id").arg("-u").stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -108,7 +108,7 @@ fn require_root_and_exit() -> ! {
     std::process::exit(1);
 }
 
-// ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА ====================
+// ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА (УЛУЧШЕНИЕ №2) ====================
 
 fn get_free_space_mb(path: &str) -> Option<u64> {
     let output = Command::new("df").arg("-BM").arg(path).stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -457,15 +457,15 @@ fn ensure_directories() {
     }
 }
 
-// УЛУЧШЕНИЕ №9: форматированная информация о папке (существование + размер + количество rpm)
+// УЛУЧШЕНИЕ №9: форматированная информация о папке
 fn folder_info_line(prefix: &str, path: &str, system_arch: &str) -> String {
     let exists = Path::new(path).exists();
     if !exists {
-        return format!("   {} {} (не существует)", prefix, path);
+        return format!("{}{} (не существует)", prefix, path);
     }
     let size_bytes = get_folder_size(path);
     let rpm_count = find_packages_flat(path, "", system_arch).len();
-    format!("   {} {} ({} .rpm, {})", prefix, path, rpm_count, format_size_bytes(size_bytes))
+    format!("{}{} ({} .rpm, {})", prefix, path, rpm_count, format_size_bytes(size_bytes))
 }
 
 fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
@@ -487,17 +487,16 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
         let _ = tx.send(LogEvent::Line(String::new()));
     }
 
-    // УЛУЧШЕНИЕ №9: показываем размер папок
     let _ = tx.send(LogEvent::Line("📦 1. school_packages/ — пакеты для установки".to_string()));
-    let _ = tx.send(LogEvent::Line(folder_info_line("├──", &base_packages, &system_arch)));
+    let _ = tx.send(LogEvent::Line(folder_info_line("   ├── ", &base_packages, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("🔄 2. updates/ — обновления системы".to_string()));
-    let _ = tx.send(LogEvent::Line(folder_info_line("├──", &base_updates, &system_arch)));
+    let _ = tx.send(LogEvent::Line(folder_info_line("   ├── ", &base_updates, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("🔐 3. cryptopro_gia/ — КриптоПро + ГИА".to_string()));
-    let _ = tx.send(LogEvent::Line(folder_info_line("├──", &crypto_dir, &system_arch)));
+    let _ = tx.send(LogEvent::Line(folder_info_line("   ├── ", &crypto_dir, &system_arch)));
     let crypto_subdir = format!("{}/linux-amd64", crypto_dir);
     if Path::new(&crypto_subdir).exists() {
         let _ = tx.send(LogEvent::Line("   │   ├── install.sh        (ОБЯЗАТЕЛЬНО)".to_string()));
@@ -511,7 +510,7 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("🔒 4. cer/ — корневые сертификаты".to_string()));
-    let _ = tx.send(LogEvent::Line(folder_info_line("└──", &cert_dir, &system_arch)));
+    let _ = tx.send(LogEvent::Line(folder_info_line("   └── ", &cert_dir, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
@@ -735,7 +734,9 @@ fn detect_proxy_from_gsettings() -> Option<String> {
                 .arg("get").arg("org.gnome.system.proxy.http").arg("port")
                 .stdout(Stdio::piped()).stderr(Stdio::null()).output();
             if let Ok(port_out) = port_output {
-                let port = String::from_utf8_lossy(&port_out.stdout).trim();
+                // ✅ ИСПРАВЛЕНИЕ E0716: сохраняем trim() в owned String
+                let port_str = String::from_utf8_lossy(&port_out.stdout);
+                let port = port_str.trim().to_string();
                 if !port.is_empty() && port != "0" {
                     return Some(format!("http://{}:{}", host, port));
                 }
@@ -1391,7 +1392,6 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
         }
         "detect_os" => {
             print_setup_instructions(tx);
-            // УЛУЧШЕНИЕ №9: подробная информация с размерами
             let mut info = format!("🖥 ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
             info += &format!("\n  🌐 Прокси: {}", get_proxy_url());
             info += &format!("\n  🔒 cer: {}", folder_info_line("", &cert_dir, &system_arch));
@@ -1737,7 +1737,8 @@ fn main() -> io::Result<()> {
                     println!("✅ Найден на смонтированном устройстве: {}", cert_path);
                 } else if let Some(device) = find_first_usb_device() {
                     println!("⚠ На смонтированных не найден. Монтирую {}...", device);
-                    let (tx, rx) = mpsc::channel::<LogEvent>();
+                    // ✅ ИСПРАВЛЕНИЕ: _rx вместо rx
+                    let (tx, _rx) = mpsc::channel::<LogEvent>();
                     if let Some(mount_point) = mount_usb_device(&device, &tx) {
                         let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
                         if cert_path.exists() {
