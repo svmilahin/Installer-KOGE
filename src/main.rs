@@ -29,6 +29,7 @@ const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const CERT_FILE_NAME: &str = "ca-root.crt";
 const PROXY_TEST_URL: &str = "http://ya.ru";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 5;
+const VERSION: &str = "1.0.0";
 
 const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
 const DEFAULT_CERT_DIR: &str = "cer";
@@ -50,6 +51,15 @@ fn log_file_path() -> String {
         }
     }
     LOG_FILE.to_string()
+}
+
+fn get_report_dir() -> String {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.to_string_lossy().to_string();
+        }
+    }
+    ".".to_string()
 }
 
 fn rotate_log_if_needed() {
@@ -86,7 +96,7 @@ fn log_session_start() {
     log_to_file(&format!("Прокси: {}", get_proxy_url()));
 }
 
-// ==================== ПРОВЕРКА ПРАВ ROOT (УЛУЧШЕНИЕ №1) ====================
+// ==================== ПРОВЕРКА ПРАВ ROOT ====================
 
 fn check_root() -> bool {
     let output = Command::new("id").arg("-u").stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -108,7 +118,7 @@ fn require_root_and_exit() -> ! {
     std::process::exit(1);
 }
 
-// ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА (УЛУЧШЕНИЕ №2) ====================
+// ==================== ПРОВЕРКА СВОБОДНОГО МЕСТА ====================
 
 fn get_free_space_mb(path: &str) -> Option<u64> {
     let output = Command::new("df").arg("-BM").arg(path).stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -132,7 +142,6 @@ fn format_size_mb(mb: u64) -> String {
     if mb >= 1024 { format!("{:.1} ГБ", mb as f64 / 1024.0) } else { format!("{} МБ", mb) }
 }
 
-// УЛУЧШЕНИЕ №9: форматирование байт в читаемый вид
 fn format_size_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -324,13 +333,13 @@ fn colorize_log_line(text: &str) -> Line<'static> {
     let t = text.trim();
     let color = if t.is_empty() {
         Color::White
-    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") || t.contains("Найден") {
+    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") || t.contains("Найден") || t.contains("Отчёт") {
         Color::Green
     } else if t.starts_with("❌") || t.starts_with("[X]") || t.contains("Ошибка") || t.contains("не удалось") || t.contains("не найден") {
         Color::Red
     } else if t.starts_with("⚠") || t.starts_with("[!]") || t.contains("ВНИМАНИЕ") || t.contains("пропускаем") {
         Color::Yellow
-    } else if t.starts_with("📊") || t.starts_with("📥") || t.starts_with("💾") || t.starts_with("🔒") || t.starts_with("🌐") || t.starts_with("🔐") || t.starts_with("📦") || t.starts_with("🚀") || t.starts_with("🔑") || t.starts_with("🔍") || t.starts_with("⚙") {
+    } else if t.starts_with("📊") || t.starts_with("📥") || t.starts_with("💾") || t.starts_with("🔒") || t.starts_with("🌐") || t.starts_with("🔐") || t.starts_with("📦") || t.starts_with("🚀") || t.starts_with("🔑") || t.starts_with("🔍") || t.starts_with("⚙") || t.starts_with("📄") {
         Color::Cyan
     } else if t.starts_with("===") {
         Color::Magenta
@@ -391,6 +400,13 @@ fn command_exists(name: &str) -> bool {
 
 fn detect_arch() -> String {
     Command::new("uname").arg("-m").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase().to_string()).unwrap_or_else(|_| "x86_64".to_string())
+}
+
+fn get_hostname() -> String {
+    Command::new("hostname")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn real_home_and_user() -> (String, Option<String>) {
@@ -457,7 +473,6 @@ fn ensure_directories() {
     }
 }
 
-// УЛУЧШЕНИЕ №9: форматированная информация о папке
 fn folder_info_line(prefix: &str, path: &str, system_arch: &str) -> String {
     let exists = Path::new(path).exists();
     if !exists {
@@ -578,7 +593,7 @@ fn find_packages_by_substring(folder: &str, substring: &str, system_arch: &str) 
     result
 }
 
-// ==================== УЛУЧШЕНИЕ №7: ПОИСК СЕРТИФИКАТА НА USB ====================
+// ==================== ПОИСК СЕРТИФИКАТА НА USB ====================
 
 fn find_cert_on_mounted_devices() -> Option<String> {
     let search_paths = vec!["/run/media/*/*", "/media/*/*", "/mnt/*"];
@@ -652,12 +667,28 @@ fn mount_usb_device(device: &str, tx: &mpsc::Sender<LogEvent>) -> Option<String>
     }
 }
 
-fn unmount_device(mount_point: &str, tx: &mpsc::Sender<LogEvent>) {
-    let _ = tx.send(LogEvent::Line("   Размонтирую флешку...".to_string()));
-    let _ = Command::new("umount").arg(mount_point).status();
+fn is_mountpoint(path: &str) -> bool {
+    Command::new("mountpoint")
+        .arg("-q")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
-// ==================== УЛУЧШЕНИЕ №8: АВТОНАСТРОЙКА ПРОКСИ ====================
+fn unmount_device(mount_point: &str, tx: &mpsc::Sender<LogEvent>) {
+    if is_mountpoint(mount_point) {
+        let _ = tx.send(LogEvent::Line("   Размонтирую флешку...".to_string()));
+        let _ = Command::new("umount").arg(mount_point).status();
+        let _ = tx.send(LogEvent::Line("   ✅ Флешка размонтирована".to_string()));
+    } else {
+        let _ = tx.send(LogEvent::Line("   ℹ Флешка уже размонтирована или не была смонтирована".to_string()));
+    }
+}
+
+// ==================== АВТОНАСТРОЙКА ПРОКСИ ====================
 
 fn test_proxy_connectivity(proxy_url: &str, tx: &mpsc::Sender<LogEvent>) -> bool {
     let _ = tx.send(LogEvent::Line(format!("   🌐 Проверяю доступность {} через {}...", PROXY_TEST_URL, proxy_url)));
@@ -734,7 +765,6 @@ fn detect_proxy_from_gsettings() -> Option<String> {
                 .arg("get").arg("org.gnome.system.proxy.http").arg("port")
                 .stdout(Stdio::piped()).stderr(Stdio::null()).output();
             if let Ok(port_out) = port_output {
-                // ✅ ИСПРАВЛЕНИЕ E0716: сохраняем trim() в owned String
                 let port_str = String::from_utf8_lossy(&port_out.stdout);
                 let port = port_str.trim().to_string();
                 if !port.is_empty() && port != "0" {
@@ -1018,16 +1048,26 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 
     for cert in &certs {
         let nick = Path::new(cert).file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let check_cmd = format!("echo '' | certutil -d '{}' -L 2>/dev/null | grep -q '{}'", nssdb, nick);
-        let already_in_nss = Command::new("sh").arg("-c").arg(&check_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-        if already_in_nss {
-            let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {} уже установлен", nick)));
-            continue;
-        }
+        
+        let del_cmd = format!("echo '' | certutil -d '{}' -D -n '{}' 2>/dev/null", nssdb, nick);
+        let _ = Command::new("sh").arg("-c").arg(&del_cmd)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+
         let add_cmd = format!("echo '' | certutil -d '{}' -A -t 'C,,' -n '{}' -i '{}'", nssdb, nick, cert);
         let _ = tx.send(LogEvent::Line(format!("Добавляю в NSS: {}...", nick)));
         match Command::new("sh").arg("-c").arg(&add_cmd).stdout(Stdio::piped()).stderr(Stdio::piped()).status() {
-            Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {}", nick))); }
+            Ok(s) if s.success() => {
+                let verify_cmd = format!("echo '' | certutil -d '{}' -L 2>/dev/null | grep -q '{}'", nssdb, nick);
+                let verified = Command::new("sh").arg("-c").arg(&verify_cmd)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).status()
+                    .map(|s| s.success()).unwrap_or(false);
+                
+                if verified {
+                    let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {} (проверено)", nick)));
+                } else {
+                    let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS: {} добавлен, но проверка не прошла", nick)));
+                }
+            }
             Ok(_s) => { let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS не добавлен: {}", nick))); }
             Err(e) => { let _ = tx.send(LogEvent::Line(format!("   ❌ NSS ошибка: {}", e))); }
         }
@@ -1305,6 +1345,158 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
 
 fn get_packages() -> Vec<&'static str> { vec!["task-koge", "r7-office", "notepadqq"] }
 
+// ==================== УЛУЧШЕНИЕ №10: ЭКСПОРТ ОТЧЁТА ====================
+
+struct InstalledPackage {
+    name: String,
+    version: String,
+    arch: String,
+    install_date: String,
+    size_mb: f64,
+}
+
+fn get_installed_packages() -> Vec<InstalledPackage> {
+    let output = Command::new("rpm")
+        .arg("-qa")
+        .arg("--qf")
+        .arg("%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{INSTALLTIME:date:%Y-%m-%d %H:%M}\t%{SIZE}\n")
+        .output();
+    
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.lines()
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 5 {
+                        let size_bytes: u64 = parts[4].parse().unwrap_or(0);
+                        Some(InstalledPackage {
+                            name: parts[0].to_string(),
+                            version: parts[1].to_string(),
+                            arch: parts[2].to_string(),
+                            install_date: parts[3].to_string(),
+                            size_mb: size_bytes as f64 / (1024.0 * 1024.0),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        Err(_) => vec![],
+    }
+}
+
+fn get_our_package_prefixes() -> Vec<&'static str> {
+    vec![
+        "task-koge", "r7-office", "notepadqq",
+        "newt", "pcsc-lite", "librtpkcs11ecp",
+        "lsb-cprocsp-base", "lsb-cprocsp-rdr", "lsb-cprocsp-kc1", "lsb-cprocsp-kc2",
+        "lsb-cprocsp-capilite", "cprocsp-curl", "lsb-cprocsp-ca-certs", "cprocsp-compat",
+        "GIA11_PPE",
+        "nss-tools", "libnss3-tools",
+        "kumir2", "python3", "fpc", "lazarus", "geany", "codeblocks", "libreoffice", "chromium", "gimp",
+    ]
+}
+
+fn filter_our_packages(packages: &[InstalledPackage]) -> Vec<&InstalledPackage> {
+    let prefixes = get_our_package_prefixes();
+    packages.iter()
+        .filter(|p| prefixes.iter().any(|prefix| p.name.starts_with(prefix)))
+        .collect()
+}
+
+fn format_txt_report(packages: &[&InstalledPackage], timestamp: &str) -> String {
+    let mut report = String::new();
+    report += "ОТЧЁТ ПО УСТАНОВЛЕННОМУ ПО (school-installer)\n";
+    report += "=============================================\n";
+    report += &format!("Дата отчёта: {}\n", timestamp);
+    report += &format!("ОС: МОС ОС (ROSA) | Архитектура: {}\n", detect_arch());
+    report += &format!("Хост: {}\n", get_hostname());
+    report += &format!("Версия установщика: {}\n\n", VERSION);
+    
+    report += "УСТАНОВЛЕННЫЕ ПАКЕТЫ:\n";
+    report += "---------------------\n";
+    
+    if packages.is_empty() {
+        report += "  (наши пакеты не найдены в системе)\n";
+    } else {
+        for pkg in packages {
+            report += &format!("  {:<35} {:<18} {:<8} {:>8.1} МБ\n",
+                format!("{}-{}", pkg.name, pkg.version),
+                pkg.install_date,
+                pkg.arch,
+                pkg.size_mb
+            );
+        }
+    }
+    
+    report += &format!("\nВсего пакетов: {}\n", packages.len());
+    
+    let total_size: f64 = packages.iter().map(|p| p.size_mb).sum();
+    report += &format!("Общий размер: {:.1} МБ\n\n", total_size);
+    
+    report += "ИНФОРМАЦИЯ О ПАПКАХ:\n";
+    report += "--------------------\n";
+    let system_arch = detect_arch();
+    report += &format!("  school_packages: {}\n", folder_info_line("", &get_school_packages_dir(), &system_arch));
+    report += &format!("  updates: {}\n", folder_info_line("", &get_updates_dir(), &system_arch));
+    report += &format!("  cryptopro_gia: {}\n", folder_info_line("", &get_crypto_dir(), &system_arch));
+    report += &format!("  cer: {}\n", folder_info_line("", &get_cert_dir(), &system_arch));
+    
+    if let Some(free_mb) = get_free_space_mb(".") {
+        report += &format!("\nСВОБОДНО НА ДИСКЕ: {}\n", format_size_mb(free_mb));
+    }
+    
+    report += &format!("\n---\nОтчёт создан school-installer v{}\n", VERSION);
+    
+    report
+}
+
+fn format_csv_report(packages: &[&InstalledPackage], timestamp: &str) -> String {
+    let mut csv = String::new();
+    csv += &format!("# Отчёт school-installer v{} от {}\n", VERSION, timestamp);
+    csv += &format!("# Хост: {} | ОС: МОС ОС | Арх: {}\n", get_hostname(), detect_arch());
+    csv += "name,version,arch,install_date,size_mb\n";
+    for pkg in packages {
+        csv += &format!("{},{},{},{},{:.1}\n",
+            pkg.name, pkg.version, pkg.arch, pkg.install_date, pkg.size_mb
+        );
+    }
+    csv
+}
+
+fn export_report(format: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let _ = tx.send(LogEvent::Line("📄 Генерирую отчёт...".to_string()));
+    log_to_file("Генерация отчёта");
+    
+    let all_packages = get_installed_packages();
+    let our_packages = filter_our_packages(&all_packages);
+    
+    let timestamp = chrono_now_approx();
+    let content = match format {
+        "csv" => format_csv_report(&our_packages, &timestamp),
+        _ => format_txt_report(&our_packages, &timestamp),
+    };
+    
+    let report_dir = get_report_dir();
+    let filename = format!("school-installer-report-{}.{}", timestamp, format);
+    let filepath = Path::new(&report_dir).join(&filename);
+    
+    match fs::write(&filepath, &content) {
+        Ok(_) => {
+            let _ = tx.send(LogEvent::Line(format!("✅ Отчёт сохранён: {}", filepath.display())));
+            log_to_file(&format!("Отчёт сохранён: {}", filepath.display()));
+            (true, format!("Отчёт сохранён: {}", filepath.display()))
+        }
+        Err(e) => {
+            let _ = tx.send(LogEvent::Line(format!("❌ Ошибка записи: {}", e)));
+            log_to_file(&format!("Ошибка записи отчёта: {}", e));
+            (false, format!("Ошибка записи отчёта: {}", e))
+        }
+    }
+}
+
 // ==================== ДИСПЕТЧЕР КОМАНД ====================
 
 fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
@@ -1390,6 +1582,7 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
                 (false, "USB-устройства не найдены. Вставьте флешку с сертификатом.".to_string())
             }
         }
+        "export_report" => export_report("txt", tx),
         "detect_os" => {
             print_setup_instructions(tx);
             let mut info = format!("🖥 ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
@@ -1426,19 +1619,20 @@ struct CommandItem {
 
 const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, размеры, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
-    CommandItem { id: "auto_proxy", name: "Автонастройка прокси", description: "Автоматически определяет прокси из окружения, gsettings, WPAD и проверяет доступность. УЛУЧШЕНИЕ №8.", icon: "⚙", hotkey: '9' },
+    CommandItem { id: "auto_proxy", name: "Автонастройка прокси", description: "Автоматически определяет прокси из окружения, gsettings, WPAD и проверяет доступность.", icon: "⚙", hotkey: '9' },
     CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' или с USB в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
-    CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Автоматически ищет ca-root.crt на всех смонтированных устройствах и USB-флешках. УЛУЧШЕНИЕ №7.", icon: "🔍", hotkey: '8' },
+    CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Автоматически ищет ca-root.crt на всех смонтированных устройствах и USB-флешках.", icon: "🔍", hotkey: '8' },
     CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Исключает i686 пакеты. Проверяет свободное место (мин. 1 ГБ).", icon: "⬇", hotkey: '3' },
     CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ офлайн. Проверяет свободное место перед установкой.", icon: "⬆", hotkey: '4' },
     CommandItem { id: "download_packages", name: "Скачать пакеты", description: "Скачивает task-koge + r7-office + notepadqq. Проверяет свободное место (мин. 2 ГБ).", icon: "📦", hotkey: '5' },
     CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ офлайн. Проверяет свободное место.", icon: "🚀", hotkey: '6' },
     CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "5 шагов: newt → pcsc-lite → librtpkcs11ecp → КриптоПро → GIA11_PPE → pcscd. Проверяет свободное место (мин. 500 МБ).", icon: "🔐", hotkey: '7' },
+    CommandItem { id: "export_report", name: "Экспорт отчёта (TXT)", description: "Создаёт TXT-отчёт об установленных пакетах для администрации школы. Сохраняется рядом с программой.", icon: "📄", hotkey: 'e' },
     CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕", hotkey: '0' },
 ];
 
 fn needs_confirmation(cmd_id: &str) -> bool {
-    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia" | "find_cert" | "auto_proxy")
+    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia" | "find_cert" | "auto_proxy" | "export_report")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1501,7 +1695,8 @@ impl App {
             '7' => self.selected = 8,
             '8' => self.selected = 3,
             '9' => self.selected = 1,
-            '0' => self.selected = 9,
+            'e' | 'E' | 'у' | 'У' => self.selected = 9,  // Экспорт отчёта
+            '0' => self.selected = 10,
             _ => return,
         }
         self.list_state.select(Some(self.selected));
@@ -1573,7 +1768,7 @@ fn ui(f: &mut Frame, app: &App) {
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(" ШКОЛЬНЫЙ УСТАНОВЩИК ПО ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(format!("ОС: МОС ОС | Арх: {}", app.arch), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("ОС: МОС ОС | Арх: {} | v{}", app.arch, VERSION), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
     ])])
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(header, chunks[0]);
@@ -1592,9 +1787,9 @@ fn ui(f: &mut Frame, app: &App) {
         ]))
     }).collect();
 
-    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-9=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
+    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-9,E=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
                      else if app.pending_command.is_some() { " ⚠️ ОЖИДАНИЕ ПОДТВЕРЖДЕНИЯ: Y=да, N=отмена " }
-                     else { " КОМАНДЫ (1-9: выбор, h: помощь, ↑↓, Enter, q) " };
+                     else { " КОМАНДЫ (1-9,E: выбор, h: помощь, ↑↓, Enter, q) " };
 
     let commands_list = List::new(items).block(Block::default().title(menu_title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
@@ -1614,6 +1809,7 @@ fn ui(f: &mut Frame, app: &App) {
             Line::from("  5 — 📦 Скачать пакеты"),
             Line::from("  6 — 🚀 Установить пакеты"),
             Line::from("  7 — 🔐 Установить КриптоПро + ГИА"),
+            Line::from("  E — 📄 Экспорт отчёта (TXT)"),
             Line::from("  0 — ✕ Выход"),
             Line::from(""),
             Line::from("  ↑/k — предыдущий пункт"),
@@ -1623,7 +1819,7 @@ fn ui(f: &mut Frame, app: &App) {
             Line::from("  q/Esc — выход"),
             Line::from("  Ctrl+C — аварийный выход"),
             Line::from(""),
-            Line::from(Span::styled("💡 Совет: нажмите цифру — команда запустится мгновенно!", Style::default().fg(Color::Green))),
+            Line::from(Span::styled("💡 Совет: нажмите цифру или E — команда запустится мгновенно!", Style::default().fg(Color::Green))),
         ];
         let help_widget = Paragraph::new(help_text).block(Block::default().title(" СПРАВКА ПО ГОРЯЧИМ КЛАВИШАМ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow))).wrap(Wrap { trim: false });
         f.render_widget(help_widget, right_chunks[0]);
@@ -1737,7 +1933,6 @@ fn main() -> io::Result<()> {
                     println!("✅ Найден на смонтированном устройстве: {}", cert_path);
                 } else if let Some(device) = find_first_usb_device() {
                     println!("⚠ На смонтированных не найден. Монтирую {}...", device);
-                    // ✅ ИСПРАВЛЕНИЕ: _rx вместо rx
                     let (tx, _rx) = mpsc::channel::<LogEvent>();
                     if let Some(mount_point) = mount_usb_device(&device, &tx) {
                         let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
@@ -1774,6 +1969,29 @@ fn main() -> io::Result<()> {
                 }
                 return Ok(());
             }
+            "export-report" => {
+                // УЛУЧШЕНИЕ №10: экспорт отчёта
+                let format = if args.len() >= 3 { args[2].as_str() } else { "txt" };
+                println!("📄 Генерирую отчёт в формате {}...", format);
+                let (tx, rx) = mpsc::channel::<LogEvent>();
+                let fmt = format.to_string();
+                thread::spawn(move || {
+                    let _ = export_report(&fmt, &tx);
+                });
+                loop {
+                    match rx.recv() {
+                        Ok(LogEvent::Line(s)) => println!("{}", s),
+                        Ok(LogEvent::Progress(p, l)) => println!("[{:>3.0}%] {}", p * 100.0, l),
+                        Ok(LogEvent::Done(ok, msg)) => {
+                            println!("{}", msg);
+                            if !ok { std::process::exit(1); }
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                return Ok(());
+            }
             "show-settings" => {
                 println!("=== Текущие настройки ===\n");
                 println!("Файл: {}", SETTINGS_FILE);
@@ -1784,7 +2002,6 @@ fn main() -> io::Result<()> {
                 println!("Папка обновлений: {}", get_updates_dir());
                 if let Some(free_mb) = get_free_space_mb(".") { println!("💾 Свободно на диске: {}", format_size_mb(free_mb)); }
                 println!("\n📝 Лог: {}", log_file_path());
-                // УЛУЧШЕНИЕ №9: размеры папок
                 let system_arch = detect_arch();
                 println!("\n📊 Размеры папок:");
                 println!("  school_packages: {}", folder_info_line("", &get_school_packages_dir(), &system_arch));
@@ -1809,7 +2026,7 @@ fn main() -> io::Result<()> {
         let cmd_id = match mode {
             "setup-env" => "setup_env", "download-updates" => "download_updates", "install-updates" => "install_updates",
             "download-packages" => "download_packages", "install-packages" => "install_packages", "install-crypto-gia" => "install_cryptopro_gia",
-            "find-cert" => "find_cert", "auto-proxy" => "auto_proxy",
+            "find-cert" => "find_cert", "auto-proxy" => "auto_proxy", "export-report" => "export_report",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
         thread::spawn(move || run_command(&cmd_id, &tx));
@@ -1866,6 +2083,7 @@ fn main() -> io::Result<()> {
                     if !app.is_running {
                         match c {
                             '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '0' => { app.select_by_hotkey(c); if c == '0' { break; } continue; }
+                            'e' | 'E' | 'у' | 'У' => { app.select_by_hotkey(c); continue; }
                             'h' | 'H' | 'р' | 'Р' => { app.toggle_help(); continue; }
                             _ => {}
                         }
