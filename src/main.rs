@@ -33,11 +33,11 @@ const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const CERT_FILE_NAME: &str = "ca-root.crt";
 const PROXY_TEST_URL: &str = "http://ya.ru";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 5;
-const VERSION: &str = "1.0.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const MAX_PARALLEL_DOWNLOADS: usize = 4;
 
-const GITHUB_REPO_OWNER: &str = "your-org";
+const GITHUB_REPO_OWNER: &str = "svmilahin";
 const GITHUB_REPO_NAME: &str = "school-installer";
 const GITHUB_API_URL: &str = "https://api.github.com";
 
