@@ -3,31 +3,101 @@ name: 🚀 Auto Release
 on:
   push:
     tags:
-      - 'v*'  # Триггер только при пуше тега вида v1.0.0
+      - 'v*'
 
 permissions:
-  contents: write  # Нужно для создания релиза
+  contents: write
 
 jobs:
-  build-and-release:
-    name: Build & Release
+  sync-version:
+    name: 🔢 Sync version from tag
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-        include:
-          - target: x86_64-unknown-linux-gnu
-            asset_name: school-installer-linux-amd64.tar.gz
-            archive_name: school-installer-linux-amd64
-          - target: aarch64-unknown-linux-gnu
-            asset_name: school-installer-linux-arm64.tar.gz
-            archive_name: school-installer-linux-arm64
-
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      clean_version: ${{ steps.parse.outputs.clean_version }}
+      is_prerelease: ${{ steps.parse.outputs.is_prerelease }}
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main  # ← важно: работаем с main, не с тегом
+
+      - name: 🧮 Parse version from tag
+        id: parse
+        run: |
+          # Извлекаем версию из тега: refs/tags/v1.0.2 → 1.0.2
+          RAW_TAG="${GITHUB_REF#refs/tags/}"
+          echo "raw_tag=$RAW_TAG"
+          
+          # Удаляем префикс v: v1.0.2 → 1.0.2
+          CLEAN_VERSION="${RAW_TAG#v}"
+          
+          # Проверяем pre-release (rc, beta, alpha)
+          IS_PRE=false
+          if [[ "$CLEAN_VERSION" =~ (alpha|beta|rc) ]]; then
+            IS_PRE=true
+            # Для Cargo.toml нужна чистая семвер: 1.0.2-rc1 → 1.0.2
+            CLEAN_VERSION=$(echo "$CLEAN_VERSION" | sed 's/-.*//')
+          fi
+          
+          echo "version=$RAW_TAG" >> $GITHUB_OUTPUT
+          echo "clean_version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$IS_PRE" >> $GITHUB_OUTPUT
+          
+          echo "📌 Тег: $RAW_TAG"
+          echo "📌 Чистая версия для Cargo.toml: $CLEAN_VERSION"
+          echo "📌 Pre-release: $IS_PRE"
+
+      - name: ✏️ Update Cargo.toml with new version
+        run: |
+          VERSION="${{ steps.parse.outputs.clean_version }}"
+          echo "🔄 Обновляем Cargo.toml до версии $VERSION"
+          
+          # Заменяем version = "..." на version = "$VERSION"
+          sed -i -E "s/^version\s*=\s*\"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+          
+          # Проверяем результат
+          echo "📄 Cargo.toml после обновления:"
+          head -10 Cargo.toml
+          
+          # Проверяем, что замена прошла успешно
+          if ! grep -q "^version = \"$VERSION\"" Cargo.toml; then
+            echo "❌ Не удалось обновить версию в Cargo.toml!"
+            exit 1
+          fi
+          echo "✅ Версия в Cargo.toml: $VERSION"
+
+      - name: 📤 Commit updated Cargo.toml back to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          if git diff --cached --quiet; then
+            echo "ℹ️ Cargo.toml уже актуален, коммит не нужен"
+          else
+            git commit -m "🔖 Bump version to ${{ steps.parse.outputs.clean_version }} [skip ci]"
+            git push origin main
+            echo "✅ Cargo.toml обновлён в main"
+          fi
+
+  build-and-release:
+    name: 🏗️ Build & Release (${{ matrix.target }})
+    needs: sync-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset_name: school-installer-linux-amd64.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            asset_name: school-installer-linux-arm64.tar.gz
+
+    steps:
+      - name: 📥 Checkout main (with updated Cargo.toml)
+        uses: actions/checkout@v4
+        with:
+          ref: main  # ← берём main, где уже обновлённый Cargo.toml
 
       - name: 🦀 Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,6 +119,21 @@ jobs:
       - name: 🏗️ Build release
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: 🔍 Verify embedded version
+        run: |
+          # Проверяем, что версия в бинарнике совпадает с тегом
+          EXPECTED="${{ needs.sync-version.outputs.clean_version }}"
+          ACTUAL=$(./target/${{ matrix.target }}/release/school-installer --version 2>/dev/null || echo "unknown")
+          echo "Ожидаемая версия: $EXPECTED"
+          echo "Фактическая версия: $ACTUAL"
+          # Извлекаем версию из вывода
+          BINARY_VERSION=$(./target/${{ matrix.target }}/release/school-installer --show-settings 2>/dev/null | grep -oP 'v[\d.]+' | head -1 | tr -d 'v' || echo "")
+          if [ -n "$BINARY_VERSION" ] && [ "$BINARY_VERSION" != "$EXPECTED" ]; then
+            echo "⚠️  Предупреждение: версия в бинарнике ($BINARY_VERSION) не совпадает с ожидаемой ($EXPECTED)"
+          else
+            echo "✅ Версии совпадают"
+          fi
+
       - name: 📦 Create archive
         run: |
           mkdir -p release
@@ -57,53 +142,37 @@ jobs:
           cd release
           tar -czf ../${{ matrix.asset_name }} school-installer
           cd ..
-          echo "Archive size: $(du -h ${{ matrix.asset_name }} | cut -f1)"
-
-      - name: 🏷️ Extract version from tag
-        id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: 📝 Generate changelog
-        id: changelog
-        uses: jaywcjlove/changelog-generator@main
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          filter: '[\s\S]*'
-          template: |
-            ## Что нового в v${{ steps.get_version.outputs.version }}
-
-            ${body}
-
-            ---
-            *Автоматический релиз от GitHub Actions*
+          echo "📦 Размер архива: $(du -h ${{ matrix.asset_name }} | cut -f1)"
 
       - name: 🚀 Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "🎉 v${{ steps.get_version.outputs.version }}"
-          body: ${{ steps.changelog.outputs.changelog }}
-          files: |
-            ${{ matrix.asset_name }}
+          tag_name: ${{ needs.sync-version.outputs.version }}
+          name: "🎉 ${{ needs.sync-version.outputs.version }}"
+          files: ${{ matrix.asset_name }}
           draft: false
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
+          prerelease: ${{ needs.sync-version.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  notify:
-    name: 📢 Notify
-    needs: build-and-release
+  summary:
+    name: 📊 Release summary
+    needs: [sync-version, build-and-release]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: 📋 Release summary
+      - name: 📋 Write summary
         run: |
-          echo "## 🚀 Релиз завершён!" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Релиз ${{ needs.sync-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Статус:** ${{ needs.build-and-release.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Тег:** ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Коммит:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Поле | Значение |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Тег | \`${{ needs.sync-version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Версия в Cargo.toml | \`${{ needs.sync-version.outputs.clean_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-release | ${{ needs.sync-version.outputs.is_prerelease }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Статус сборки | ${{ needs.build-and-release.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Скачать:" >> $GITHUB_STEP_SUMMARY
-          echo "- [school-installer-linux-amd64.tar.gz](${{ github.server_url }}/${{ github.repository }}/releases/latest/download/school-installer-linux-amd64.tar.gz)" >> $GITHUB_STEP_SUMMARY
-          echo "- [school-installer-linux-arm64.tar.gz](${{ github.server_url }}/${{ github.repository }}/releases/latest/download/school-installer-linux-arm64.tar.gz)" >> $GITHUB_STEP_SUMMARY
+          echo "### 📥 Скачать:" >> $GITHUB_STEP_SUMMARY
+          echo "- [Linux x86_64](https://github.com/${{ github.repository }}/releases/download/${{ needs.sync-version.outputs.version }}/school-installer-linux-amd64.tar.gz)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Linux ARM64](https://github.com/${{ github.repository }}/releases/download/${{ needs.sync-version.outputs.version }}/school-installer-linux-arm64.tar.gz)" >> $GITHUB_STEP_SUMMARY
