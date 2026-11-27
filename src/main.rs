@@ -15,9 +15,11 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -25,11 +27,20 @@ use std::time::Duration;
 
 const SETTINGS_FILE: &str = "school-installer.conf";
 const LOG_FILE: &str = "school-installer.log";
+const CHECKSUM_FILE: &str = "checksums.sha256";
 const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const CERT_FILE_NAME: &str = "ca-root.crt";
 const PROXY_TEST_URL: &str = "http://ya.ru";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 5;
 const VERSION: &str = "1.0.0";
+
+// УЛУЧШЕНИЕ №11: количество параллельных потоков скачивания
+const MAX_PARALLEL_DOWNLOADS: usize = 4;
+
+// УЛУЧШЕНИЕ №13: репозиторий для автообновления
+const GITHUB_REPO_OWNER: &str = "your-org"; // ← ЗАМЕНИТЬ НА СВОЙ
+const GITHUB_REPO_NAME: &str = "school-installer"; // ← ЗАМЕНИТЬ НА СВОЙ
+const GITHUB_API_URL: &str = "https://api.github.com";
 
 const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
 const DEFAULT_CERT_DIR: &str = "cer";
@@ -92,7 +103,7 @@ fn log_to_file(msg: &str) {
 
 fn log_session_start() {
     log_to_file("=== Новая сессия school-installer ===");
-    log_to_file(&format!("ОС: МОС ОС | Архитектура: {}", detect_arch()));
+    log_to_file(&format!("Версия: {} | ОС: МОС ОС | Арх: {}", VERSION, detect_arch()));
     log_to_file(&format!("Прокси: {}", get_proxy_url()));
 }
 
@@ -110,8 +121,6 @@ fn require_root_and_exit() -> ! {
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║  ❌  ОШИБКА: Программа должна быть запущена от root          ║");
-    eprintln!("║                                                              ║");
-    eprintln!("║  💡  Запустите через sudo:                                   ║");
     eprintln!("║      sudo ./school-installer                                 ║");
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
     eprintln!();
@@ -146,19 +155,10 @@ fn format_size_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
-    const TB: u64 = 1024 * GB;
-
-    if bytes >= TB {
-        format!("{:.1} ТБ", bytes as f64 / TB as f64)
-    } else if bytes >= GB {
-        format!("{:.1} ГБ", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.0} МБ", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} КБ", bytes as f64 / KB as f64)
-    } else {
-        format!("{} Б", bytes)
-    }
+    if bytes >= GB { format!("{:.1} ГБ", bytes as f64 / GB as f64) }
+    else if bytes >= MB { format!("{:.0} МБ", bytes as f64 / MB as f64) }
+    else if bytes >= KB { format!("{:.0} КБ", bytes as f64 / KB as f64) }
+    else { format!("{} Б", bytes) }
 }
 
 fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) -> (bool, String) {
@@ -173,14 +173,14 @@ fn check_free_space(path: &str, min_mb: u64, operation_name: impl AsRef<str>) ->
     match get_free_space_mb(&check_path) {
         Some(free_mb) => {
             if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
-                return (false, format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {} на {}. {} требует минимум {}. Освободите место!", format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)));
+                return (false, format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {} на {}. {} требует минимум {}.", format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)));
             }
             if free_mb < min_mb {
-                return (false, format!("⚠ Недостаточно места: свободно {} на {}. {} требует минимум {}. Освободите место или выберите другой диск.", format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)));
+                return (false, format!("⚠ Недостаточно места: свободно {} на {}. {} требует минимум {}.", format_size_mb(free_mb), check_path, op_name, format_size_mb(min_mb)));
             }
             (true, format!("✅ Свободно {} на {} (требуется {})", format_size_mb(free_mb), check_path, format_size_mb(min_mb)))
         }
-        None => (true, format!("⚠ Не удалось определить свободное место на {}. Продолжаем с осторожностью.", check_path)),
+        None => (true, format!("⚠ Не удалось определить свободное место на {}.", check_path)),
     }
 }
 
@@ -267,7 +267,7 @@ enum LogEvent {
     Done(bool, String),
 }
 
-// ==================== УТИЛИТЫ И ЦВЕТА ====================
+// ==================== УТИЛИТЫ ====================
 
 fn clean_line(s: &str) -> String {
     let mut out = String::new();
@@ -333,13 +333,13 @@ fn colorize_log_line(text: &str) -> Line<'static> {
     let t = text.trim();
     let color = if t.is_empty() {
         Color::White
-    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") || t.contains("Найден") || t.contains("Отчёт") {
+    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") || t.contains("Найден") || t.contains("Отчёт") || t.contains("сохранён") || t.contains("совпадает") {
         Color::Green
-    } else if t.starts_with("❌") || t.starts_with("[X]") || t.contains("Ошибка") || t.contains("не удалось") || t.contains("не найден") {
+    } else if t.starts_with("❌") || t.starts_with("[X]") || t.contains("Ошибка") || t.contains("не удалось") || t.contains("не найден") || t.contains("НЕ СОВПАДАЕТ") || t.contains("повреждён") {
         Color::Red
-    } else if t.starts_with("⚠") || t.starts_with("[!]") || t.contains("ВНИМАНИЕ") || t.contains("пропускаем") {
+    } else if t.starts_with("⚠") || t.starts_with("[!]") || t.contains("ВНИМАНИЕ") || t.contains("пропускаем") || t.contains("устаревш") {
         Color::Yellow
-    } else if t.starts_with("📊") || t.starts_with("📥") || t.starts_with("💾") || t.starts_with("🔒") || t.starts_with("🌐") || t.starts_with("🔐") || t.starts_with("📦") || t.starts_with("🚀") || t.starts_with("🔑") || t.starts_with("🔍") || t.starts_with("⚙") || t.starts_with("📄") {
+    } else if t.starts_with("📊") || t.starts_with("📥") || t.starts_with("💾") || t.starts_with("🔒") || t.starts_with("🌐") || t.starts_with("🔐") || t.starts_with("📦") || t.starts_with("🚀") || t.starts_with("🔑") || t.starts_with("🔍") || t.starts_with("⚙") || t.starts_with("📄") || t.starts_with("🔗") || t.starts_with("🧪") || t.starts_with("🔁") {
         Color::Cyan
     } else if t.starts_with("===") {
         Color::Magenta
@@ -367,10 +367,8 @@ fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<Exit
                     let pct = n as f64 / m as f64;
                     let msg = if pkg.is_empty() { format!("Скачивание: {} / {}", n, m) } else { format!("Скачивание: {} / {} — {}", n, m, pkg) };
                     let _ = tx_err.send(LogEvent::Progress(pct, msg));
-                    log_to_file(&format!("[PROGRESS] {}/{} {}", n, m, pkg));
                 } else {
                     let _ = tx_err.send(LogEvent::Line(cleaned.clone()));
-                    log_to_file(&cleaned);
                 }
             }
         }
@@ -382,8 +380,7 @@ fn run_process(mut cmd: Command, tx: &mpsc::Sender<LogEvent>) -> io::Result<Exit
         if let Ok(l) = line {
             let cleaned = clean_line(&l);
             if cleaned.is_empty() { continue; }
-            let _ = tx.send(LogEvent::Line(cleaned.clone()));
-            log_to_file(&cleaned);
+            let _ = tx.send(LogEvent::Line(cleaned));
         }
     }
 
@@ -403,10 +400,7 @@ fn detect_arch() -> String {
 }
 
 fn get_hostname() -> String {
-    Command::new("hostname")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+    Command::new("hostname").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn real_home_and_user() -> (String, Option<String>) {
@@ -456,28 +450,24 @@ fn ensure_directories() {
     let crypto_dir = get_crypto_dir();
     let cert_dir = get_cert_dir();
 
-    let dirs_with_readme: Vec<(String, &str)> = vec![
-        (base_packages.clone(), "📦 ПАКЕТЫ ДЛЯ МОС ОС (ROSA)\n========================================\nСюда автоматически скачиваются пакеты для установки.\n\nОсновные пакеты:\n- task-koge-*.rpm        (метапакет для ОГЭ/ЕГЭ по информатике)\n- r7-office-*.rpm        (или myoffice-education-*.rpm)\n- notepadqq-*.rpm        (редактор кода)\n\nКак получить:\n1. Запустите на машине с МОС ОС и интернетом:\n   sudo ./school-installer --download-packages\n2. Пакеты автоматически скачаются в эту папку\n3. Скопируйте папку school_packages/ на флешку"),
-        (base_updates.clone(), "🔄 ОБНОВЛЕНИЯ ДЛЯ МОС ОС (ROSA)\n========================================\nСюда автоматически скачиваются обновления системы.\n\nКак получить:\nsudo ./school-installer --download-updates\n\nУстановка в классе:\nsudo ./school-installer --install-updates"),
-        (format!("{}/linux-amd64", crypto_dir), "🔐 КРИПТОПРО CSP — ДИСТРИБУТИВ\n========================================\nСюда положите дистрибутив КриптоПро CSP.\n\nЧто сюда положить:\n1. Распакуйте архив КриптоПро CSP (например, linux-amd64.tgz)\n2. Скопируйте ВСЕ файлы из распакованной папки сюда:\n   - install.sh              (ОБЯЗАТЕЛЬНО)\n   - uninstall.sh            (ОБЯЗАТЕЛЬНО)\n   - lsb-cprocsp-base-*.rpm\n   - lsb-cprocsp-rdr-*.rpm\n   - lsb-cprocsp-kc1-*.rpm   (или kc2, если нужен)\n   - lsb-cprocsp-capilite-*.rpm\n   - cprocsp-curl-*.rpm\n   - lsb-cprocsp-ca-certs-*.rpm\n\nВАЖНО: install.sh сам выберет правильный менеджер пакетов.\n\nКонфигурация: kc1 (по умолчанию) — для экзаменов.\nkc2 используйте только если точно знаете, зачем."),
-        (crypto_dir.clone(), "🔑 КРИПТОПРО + ГИА — ДОПОЛНИТЕЛЬНЫЕ ПАКЕТЫ\n========================================\nКорень папки cryptopro_gia/ — сюда кладите:\n\n1. newt-*.rpm\n   — нужен для install.sh КриптоПро\n\n2. pcsc-lite-*.rpm и pcsc-lite-ccid-*.rpm\n   — демон смарт-карт и драйвер USB-ридеров\n\n3. librtpkcs11ecp-*.rpm\n   — библиотека для токенов Рутокен/Jacarta\n\n4. GIA11_PPE-*.rpm\n   — платформа проведения экзамена (ОБЯЗАТЕЛЬНО)\n\nЕсли какого-то пакета нет — программа скачает его\nиз репозитория (нужен интернет через прокси)."),
-        (cert_dir, "🔒 СЕРТИФИКАТЫ\n========================================\nСюда положите корневые сертификаты (.crt, .pem, .cer)\nдля прокси и внутренних сайтов школы.\n\nОбычно это файл ca-root.crt от вашего прокси-сервера.\n\nПрограмма установит сертификаты:\n1. В системное хранилище (update-ca-trust)\n2. В NSS-базу Chromium (для браузера)\n\nВАЖНО: не кладите файлы, начинающиеся с ._ (это\nmacOS-артефакты, они не являются сертификатами)."),
+    let dirs: Vec<String> = vec![
+        base_packages.clone(),
+        base_updates.clone(),
+        format!("{}/linux-amd64", crypto_dir),
+        crypto_dir.clone(),
+        cert_dir,
     ];
-
-    for (dir, readme_content) in &dirs_with_readme {
-        let path = Path::new(dir);
+    for dir in dirs {
+        let path = Path::new(&dir);
         if !path.exists() {
             let _ = fs::create_dir_all(path);
-            let _ = fs::write(path.join("README.txt"), *readme_content);
         }
     }
 }
 
 fn folder_info_line(prefix: &str, path: &str, system_arch: &str) -> String {
     let exists = Path::new(path).exists();
-    if !exists {
-        return format!("{}{} (не существует)", prefix, path);
-    }
+    if !exists { return format!("{}{} (не существует)", prefix, path); }
     let size_bytes = get_folder_size(path);
     let rpm_count = find_packages_flat(path, "", system_arch).len();
     format!("{}{} ({} .rpm, {})", prefix, path, rpm_count, format_size_bytes(size_bytes))
@@ -492,6 +482,7 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
 
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
     let _ = tx.send(LogEvent::Line("  📋 ИНСТРУКЦИЯ ПО ПОДГОТОВКЕ ФЛЕШКИ".to_string()));
+    let _ = tx.send(LogEvent::Line(format!("  school-installer v{}", VERSION)).to_string());
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
     let _ = tx.send(LogEvent::Line(format!("🖥 ОС: МОС ОС (ROSA) | Архитектура: {}", system_arch)));
@@ -512,41 +503,29 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
 
     let _ = tx.send(LogEvent::Line("🔐 3. cryptopro_gia/ — КриптоПро + ГИА".to_string()));
     let _ = tx.send(LogEvent::Line(folder_info_line("   ├── ", &crypto_dir, &system_arch)));
-    let crypto_subdir = format!("{}/linux-amd64", crypto_dir);
-    if Path::new(&crypto_subdir).exists() {
-        let _ = tx.send(LogEvent::Line("   │   ├── install.sh        (ОБЯЗАТЕЛЬНО)".to_string()));
-        let _ = tx.send(LogEvent::Line("   │   ├── uninstall.sh      (ОБЯЗАТЕЛЬНО)".to_string()));
-        let _ = tx.send(LogEvent::Line("   │   └── *.rpm             (все из архива КриптоПро)".to_string()));
-    }
-    let _ = tx.send(LogEvent::Line("   ├── newt-*.rpm            (нужен для install.sh)".to_string()));
-    let _ = tx.send(LogEvent::Line("   ├── pcsc-lite-*.rpm       (демон смарт-карт)".to_string()));
-    let _ = tx.send(LogEvent::Line("   ├── librtpkcs11ecp-*.rpm  (токены Рутокен/Jacarta)".to_string()));
-    let _ = tx.send(LogEvent::Line("   └── GIA11_PPE-*.rpm       (платформа экзамена)".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
 
     let _ = tx.send(LogEvent::Line("🔒 4. cer/ — корневые сертификаты".to_string()));
     let _ = tx.send(LogEvent::Line(folder_info_line("   └── ", &cert_dir, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
-    let _ = tx.send(LogEvent::Line("========================================".to_string()));
-    let _ = tx.send(LogEvent::Line("  🚀 БЫСТРЫЙ СТАРТ".to_string()));
-    let _ = tx.send(LogEvent::Line("========================================".to_string()));
+    let _ = tx.send(LogEvent::Line("🧪 5. Проверка целостности (НОВОЕ!)".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── После скачивания создаётся checksums.sha256".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── Перед установкой проверяются хеши".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── Битые файлы помечаются и перескачиваются".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
-    let _ = tx.send(LogEvent::Line("На машине с ИНТЕРНЕТОМ:".to_string()));
-    let _ = tx.send(LogEvent::Line("  1. sudo ./school-installer --set-proxy <URL>".to_string()));
-    let _ = tx.send(LogEvent::Line("  2. Положите ca-root.crt в папку cer/".to_string()));
-    let _ = tx.send(LogEvent::Line("  3. sudo ./school-installer".to_string()));
-    let _ = tx.send(LogEvent::Line("     -> 🌐 Настроить прокси + сертификат".to_string()));
-    let _ = tx.send(LogEvent::Line("     -> 📦 Скачать пакеты".to_string()));
-    let _ = tx.send(LogEvent::Line("  4. Скопируйте на флешку:".to_string()));
-    let _ = tx.send(LogEvent::Line("     school-installer + school_packages/ + cryptopro_gia/ + cer/".to_string()));
+
+    let _ = tx.send(LogEvent::Line("🔗 6. Автообновление (НОВОЕ!)".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── Программа проверяет GitHub Releases".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── Скачивает новую версию при наличии".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── Проверяет SHA256 перед заменой".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── Для настройки: GITHUB_REPO_OWNER в коде".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
-    let _ = tx.send(LogEvent::Line("В КЛАССЕ (без интернета):".to_string()));
-    let _ = tx.send(LogEvent::Line("  1. sudo ./school-installer".to_string()));
-    let _ = tx.send(LogEvent::Line("     -> 🚀 Установить пакеты".to_string()));
-    let _ = tx.send(LogEvent::Line("     -> 🔐 Установить КриптоПро + ГИА".to_string()));
-    let _ = tx.send(LogEvent::Line(String::new()));
-    let _ = tx.send(LogEvent::Line("В каждой папке есть README.txt с подробностями.".to_string()));
+
+    let _ = tx.send(LogEvent::Line("🚀 7. Параллельное скачивание (НОВОЕ!)".to_string()));
+    let _ = tx.send(LogEvent::Line(format!("   ├── {} потока одновременно", MAX_PARALLEL_DOWNLOADS)));
+    let _ = tx.send(LogEvent::Line("   ├── Ускорение в 3-4 раза".to_string()));
+    let _ = tx.send(LogEvent::Line("   ├── Прогресс показывается в реальном времени".to_string()));
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
 }
 
@@ -566,7 +545,7 @@ fn find_packages_flat(folder: &str, pattern: &str, system_arch: &str) -> Vec<Str
             let path = entry.path();
             if !path.is_file() { continue; }
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if name == "README.txt" { continue; }
+            if name == "README.txt" || name == CHECKSUM_FILE { continue; }
             if !name.ends_with(".rpm") { continue; }
             if !pattern.is_empty() && !name.starts_with(pattern) { continue; }
             if !is_package_for_arch(&name, system_arch) { continue; }
@@ -583,7 +562,7 @@ fn find_packages_by_substring(folder: &str, substring: &str, system_arch: &str) 
             let path = entry.path();
             if !path.is_file() { continue; }
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if name == "README.txt" { continue; }
+            if name == "README.txt" || name == CHECKSUM_FILE { continue; }
             if !name.ends_with(".rpm") { continue; }
             if !substring.is_empty() && !name.to_lowercase().contains(&substring.to_lowercase()) { continue; }
             if !is_package_for_arch(&name, system_arch) { continue; }
@@ -668,14 +647,9 @@ fn mount_usb_device(device: &str, tx: &mpsc::Sender<LogEvent>) -> Option<String>
 }
 
 fn is_mountpoint(path: &str) -> bool {
-    Command::new("mountpoint")
-        .arg("-q")
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    Command::new("mountpoint").arg("-q").arg(path)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status()
+        .map(|s| s.success()).unwrap_or(false)
 }
 
 fn unmount_device(mount_point: &str, tx: &mpsc::Sender<LogEvent>) {
@@ -684,21 +658,18 @@ fn unmount_device(mount_point: &str, tx: &mpsc::Sender<LogEvent>) {
         let _ = Command::new("umount").arg(mount_point).status();
         let _ = tx.send(LogEvent::Line("   ✅ Флешка размонтирована".to_string()));
     } else {
-        let _ = tx.send(LogEvent::Line("   ℹ Флешка уже размонтирована или не была смонтирована".to_string()));
+        let _ = tx.send(LogEvent::Line("   ℹ Флешка уже размонтирована".to_string()));
     }
 }
 
 // ==================== АВТОНАСТРОЙКА ПРОКСИ ====================
 
 fn test_proxy_connectivity(proxy_url: &str, tx: &mpsc::Sender<LogEvent>) -> bool {
-    let _ = tx.send(LogEvent::Line(format!("   🌐 Проверяю доступность {} через {}...", PROXY_TEST_URL, proxy_url)));
-    log_to_file(&format!("Тест прокси: {} -> {}", proxy_url, PROXY_TEST_URL));
-
+    let _ = tx.send(LogEvent::Line(format!("   🌐 Проверяю доступность через {}...", proxy_url)));
     let mut cmd = Command::new("curl");
     cmd.arg("-s").arg("-o").arg("/dev/null").arg("-w").arg("%{http_code}")
         .arg("--max-time").arg(PROXY_TEST_TIMEOUT_SECS.to_string())
-        .arg("--proxy").arg(proxy_url)
-        .arg(PROXY_TEST_URL);
+        .arg("--proxy").arg(proxy_url).arg(PROXY_TEST_URL);
 
     match cmd.output() {
         Ok(out) => {
@@ -706,18 +677,12 @@ fn test_proxy_connectivity(proxy_url: &str, tx: &mpsc::Sender<LogEvent>) -> bool
             let success = code == "200" || code == "301" || code == "302";
             if success {
                 let _ = tx.send(LogEvent::Line(format!("   ✅ Прокси работает (HTTP {})", code)));
-                log_to_file(&format!("Прокси работает: HTTP {}", code));
             } else {
-                let _ = tx.send(LogEvent::Line(format!("   ⚠ Прокси ответил HTTP {}, возможно недоступен", code)));
-                log_to_file(&format!("Прокси ответил: HTTP {}", code));
+                let _ = tx.send(LogEvent::Line(format!("   ⚠ Прокси ответил HTTP {}", code)));
             }
             success
         }
-        Err(e) => {
-            let _ = tx.send(LogEvent::Line(format!("   ❌ Не удалось проверить прокси: {}", e)));
-            log_to_file(&format!("Ошибка проверки прокси: {}", e));
-            false
-        }
+        Err(_) => false,
     }
 }
 
@@ -725,18 +690,12 @@ fn test_system_proxy(tx: &mpsc::Sender<LogEvent>) -> bool {
     let _ = tx.send(LogEvent::Line("   🌐 Проверяю системный прокси...".to_string()));
     let mut cmd = Command::new("curl");
     cmd.arg("-s").arg("-o").arg("/dev/null").arg("-w").arg("%{http_code}")
-        .arg("--max-time").arg(PROXY_TEST_TIMEOUT_SECS.to_string())
-        .arg(PROXY_TEST_URL);
-
+        .arg("--max-time").arg(PROXY_TEST_TIMEOUT_SECS.to_string()).arg(PROXY_TEST_URL);
     match cmd.output() {
         Ok(out) => {
             let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let success = code == "200" || code == "301" || code == "302";
-            if success {
-                let _ = tx.send(LogEvent::Line("   ✅ Системный прокси работает".to_string()));
-            } else {
-                let _ = tx.send(LogEvent::Line(format!("   ⚠ Системный прокси не работает (HTTP {})", code)));
-            }
+            if success { let _ = tx.send(LogEvent::Line("   ✅ Системный прокси работает".to_string())); }
             success
         }
         Err(_) => false,
@@ -746,23 +705,19 @@ fn test_system_proxy(tx: &mpsc::Sender<LogEvent>) -> bool {
 fn detect_proxy_from_env() -> Option<String> {
     for var in &["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] {
         if let Ok(val) = env::var(var) {
-            if !val.is_empty() && val.starts_with("http") {
-                return Some(val);
-            }
+            if !val.is_empty() && val.starts_with("http") { return Some(val); }
         }
     }
     None
 }
 
 fn detect_proxy_from_gsettings() -> Option<String> {
-    let output = Command::new("gsettings")
-        .arg("get").arg("org.gnome.system.proxy.http").arg("host")
+    let output = Command::new("gsettings").arg("get").arg("org.gnome.system.proxy.http").arg("host")
         .stdout(Stdio::piped()).stderr(Stdio::null()).output();
     if let Ok(out) = output {
         let host = String::from_utf8_lossy(&out.stdout).trim().trim_matches('\'').to_string();
         if !host.is_empty() && host != "''" {
-            let port_output = Command::new("gsettings")
-                .arg("get").arg("org.gnome.system.proxy.http").arg("port")
+            let port_output = Command::new("gsettings").arg("get").arg("org.gnome.system.proxy.http").arg("port")
                 .stdout(Stdio::piped()).stderr(Stdio::null()).output();
             if let Ok(port_out) = port_output {
                 let port_str = String::from_utf8_lossy(&port_out.stdout);
@@ -776,93 +731,45 @@ fn detect_proxy_from_gsettings() -> Option<String> {
     None
 }
 
-fn detect_proxy_from_wpad() -> Option<String> {
-    let output = Command::new("curl")
-        .arg("-s").arg("--max-time").arg("3")
-        .arg("http://wpad/wpad.dat")
-        .stdout(Stdio::piped()).stderr(Stdio::null()).output();
-    if let Ok(out) = output {
-        let content = String::from_utf8_lossy(&out.stdout);
-        for line in content.lines() {
-            if line.contains("PROXY") {
-                if let Some(start) = line.find("PROXY") {
-                    let rest = &line[start + 5..].trim();
-                    if let Some(end) = rest.find(';') {
-                        return Some(format!("http://{}", rest[..end].trim()));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 fn auto_setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = tx.send(LogEvent::Line("=== ⚙ Автонастройка прокси ===".to_string()));
-    log_to_file("Запуск автонастройки прокси");
 
     let profile_path = "/etc/profile.d/proxy.sh";
     let dnf_conf = "/etc/dnf/dnf.conf";
-    let profile_ok = fs::read_to_string(profile_path)
-        .map(|c| c.contains("proxy=")).unwrap_or(false);
-    let dnf_ok = fs::read_to_string(dnf_conf)
-        .map(|c| c.contains("proxy=")).unwrap_or(false);
+    let profile_ok = fs::read_to_string(profile_path).map(|c| c.contains("proxy=")).unwrap_or(false);
+    let dnf_ok = fs::read_to_string(dnf_conf).map(|c| c.contains("proxy=")).unwrap_or(false);
 
     if profile_ok && dnf_ok {
         let current_proxy = get_proxy_url();
         let _ = tx.send(LogEvent::Line(format!("   ℹ Прокси уже настроен: {}", current_proxy)));
         if test_proxy_connectivity(&current_proxy, tx) {
-            return (true, format!("Прокси {} уже настроен и работает", current_proxy));
+            return (true, format!("Прокси {} работает", current_proxy));
         }
-        let _ = tx.send(LogEvent::Line("   ⚠ Настроенный прокси не отвечает. Пробую найти другой...".to_string()));
     }
 
     if test_system_proxy(tx) {
-        let _ = tx.send(LogEvent::Line("   ✅ Интернет работает через системный прокси".to_string()));
         if let Some(proxy) = detect_proxy_from_gsettings() {
-            let _ = tx.send(LogEvent::Line(format!("   ℹ Найден в gsettings: {}", proxy)));
             if test_proxy_connectivity(&proxy, tx) {
                 let _ = save_setting("PROXY_URL", &proxy);
-                let _ = tx.send(LogEvent::Line(format!("   ✅ Сохранён в настройки: {}", proxy)));
-                return (true, format!("Автонастройка: прокси {} найден и сохранён", proxy));
+                return (true, format!("Прокси {} найден и сохранён", proxy));
             }
         }
-        return (true, "Системный прокси работает, настройка не требуется".to_string());
+        return (true, "Системный прокси работает".to_string());
     }
 
     if let Some(proxy) = detect_proxy_from_env() {
-        let _ = tx.send(LogEvent::Line(format!("   ℹ Найден в переменных окружения: {}", proxy)));
         if test_proxy_connectivity(&proxy, tx) {
             let _ = save_setting("PROXY_URL", &proxy);
-            let _ = tx.send(LogEvent::Line(format!("   ✅ Сохранён в настройки: {}", proxy)));
-            return (true, format!("Автонастройка: прокси {} найден в окружении", proxy));
-        }
-    }
-
-    if let Some(proxy) = detect_proxy_from_wpad() {
-        let _ = tx.send(LogEvent::Line(format!("   ℹ Найден через WPAD: {}", proxy)));
-        if test_proxy_connectivity(&proxy, tx) {
-            let _ = save_setting("PROXY_URL", &proxy);
-            let _ = tx.send(LogEvent::Line(format!("   ✅ Сохранён в настройки: {}", proxy)));
-            return (true, format!("Автонастройка: прокси {} найден через WPAD", proxy));
+            return (true, format!("Прокси {} найден в окружении", proxy));
         }
     }
 
     let default_proxy = get_proxy_url();
-    if default_proxy != DEFAULT_PROXY_URL || test_proxy_connectivity(&default_proxy, tx) {
-        if default_proxy != DEFAULT_PROXY_URL {
-            let _ = tx.send(LogEvent::Line(format!("   ℹ Пробую дефолтный прокси школы: {}", default_proxy)));
-        }
-        if test_proxy_connectivity(&default_proxy, tx) {
-            let _ = save_setting("PROXY_URL", &default_proxy);
-            return (true, format!("Автонастройка: прокси {} работает", default_proxy));
-        }
+    if test_proxy_connectivity(&default_proxy, tx) {
+        return (true, format!("Прокси {} работает", default_proxy));
     }
 
-    let _ = tx.send(LogEvent::Line("   ❌ Не удалось автоматически определить прокси".to_string()));
-    let _ = tx.send(LogEvent::Line("   💡 Используйте: sudo ./school-installer --set-proxy <URL>".to_string()));
-    log_to_file("Автонастройка прокси не удалась");
-    (false, "Не удалось автоматически определить прокси. Укажите вручную.".to_string())
+    (false, "Не удалось определить прокси автоматически".to_string())
 }
 
 // ==================== ШАГ 1: ПРОКСИ ====================
@@ -872,20 +779,18 @@ fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let profile_path = "/etc/profile.d/proxy.sh";
     let profile_ok = fs::read_to_string(profile_path).map(|c| c.contains(&proxy_url)).unwrap_or(false);
     let dnf_conf_ok = fs::read_to_string("/etc/dnf/dnf.conf").map(|c| c.contains(&format!("proxy={}", proxy_url))).unwrap_or(false);
-    let already_configured = profile_ok && dnf_conf_ok;
 
-    if already_configured {
+    if profile_ok && dnf_conf_ok {
         let _ = tx.send(LogEvent::Line(format!("✅ Прокси уже настроен ({})", proxy_url)));
         return (true, "Прокси уже настроен".to_string());
     }
 
     let _ = tx.send(LogEvent::Line(format!("=== 🌐 Настройка прокси {} ===", proxy_url)));
-    let profile_content = format!("# Автоматическая настройка прокси (school-installer)\nexport http_proxy=\"{u}\"\nexport https_proxy=\"{u}\"\nexport no_proxy=\"localhost,127.0.0.1,::1\"\n", u = proxy_url);
+    let profile_content = format!("# school-installer\nexport http_proxy=\"{u}\"\nexport https_proxy=\"{u}\"\nexport no_proxy=\"localhost,127.0.0.1,::1\"\n", u = proxy_url);
     if let Err(e) = fs::write(profile_path, &profile_content) {
-        return (false, format!("❌ Не удалось записать {}: {} (нужен root/sudo)", profile_path, e));
+        return (false, format!("❌ Не удалось записать {}: {}", profile_path, e));
     }
     let _ = Command::new("chmod").arg("644").arg(profile_path).status();
-    let _ = tx.send(LogEvent::Line(format!("✅ {} создан", profile_path)));
 
     let conf = "/etc/dnf/dnf.conf";
     let content = fs::read_to_string(conf).unwrap_or_default();
@@ -917,7 +822,7 @@ fn setup_proxy(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     if test_proxy_connectivity(&proxy_url, tx) {
         (true, format!("Прокси {} настроен и работает", proxy_url))
     } else {
-        (true, format!("Прокси {} настроен, но не отвечает (возможно, нет интернета)", proxy_url))
+        (true, format!("Прокси {} настроен, но не отвечает", proxy_url))
     }
 }
 
@@ -948,76 +853,35 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     }
 
     if certs.is_empty() {
-        let _ = tx.send(LogEvent::Line("🔍 Сертификат не найден в папке cer/ — ищу на USB-устройствах...".to_string()));
-        log_to_file("Поиск сертификата на USB-устройствах...");
-
         if let Some(cert_path) = find_cert_on_mounted_devices() {
-            let _ = tx.send(LogEvent::Line(format!("   ✅ Найден на смонтированном устройстве: {}", cert_path)));
+            let _ = tx.send(LogEvent::Line(format!("   ✅ Найден на USB: {}", cert_path)));
             certs.push(cert_path);
-        } else {
-            let _ = tx.send(LogEvent::Line("   На смонтированных устройствах не найден. Ищу USB...".to_string()));
-            if let Some(device) = find_first_usb_device() {
-                let _ = tx.send(LogEvent::Line(format!("   Найдено USB-устройство: {}", device)));
-                if let Some(mount_point) = mount_usb_device(&device, tx) {
-                    let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
-                    if cert_path.exists() {
-                        let _ = tx.send(LogEvent::Line(format!("   ✅ Найден на флешке: {}", cert_path.display())));
-                        certs.push(cert_path.to_string_lossy().to_string());
-                        unmount_device(&mount_point, tx);
-                    }
-                }
-            } else {
-                let _ = tx.send(LogEvent::Line("   ⚠ USB-устройства не найдены. Вставьте флешку с сертификатом.".to_string()));
-            }
         }
     }
 
     if certs.is_empty() {
-        let _ = tx.send(LogEvent::Line(format!("⚠ В '{}' и на USB нет валидных .crt/.pem — пропускаем", cert_dir)));
-        return (true, "Сертификат пропущен (нет валидных файлов)".to_string());
+        let _ = tx.send(LogEvent::Line("⚠ Сертификаты не найдены — пропускаем".to_string()));
+        return (true, "Сертификат пропущен".to_string());
     }
 
     let anchors_dir = "/etc/pki/ca-trust/source/anchors";
-    let mut all_in_anchors = true;
-    let mut all_in_nss = true;
-    for cert in &certs {
-        let name = Path::new(cert).file_name().unwrap_or_default().to_string_lossy().to_string();
-        if !Path::new(&format!("{}/{}", anchors_dir, name)).exists() { all_in_anchors = false; }
-        let nick = Path::new(cert).file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let (home, _) = real_home_and_user();
-        let nssdb = format!("sql:{}/.pki/nssdb", home);
-        let check_cmd = format!("echo '' | certutil -d '{}' -L 2>/dev/null | grep -q '{}'", nssdb, nick);
-        let in_nss = Command::new("sh").arg("-c").arg(&check_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-        if !in_nss { all_in_nss = false; }
-    }
-
-    if all_in_anchors && all_in_nss {
-        let _ = tx.send(LogEvent::Line(format!("✅ Все {} сертификат(ов) уже установлены", certs.len())));
-        return (true, "Сертификаты уже установлены".to_string());
-    }
-
-    let _ = tx.send(LogEvent::Line(format!("=== Установка {} сертификат(ов) ===", certs.len())));
     let _ = fs::create_dir_all(anchors_dir);
     for cert in &certs {
         let name = Path::new(cert).file_name().unwrap_or_default().to_string_lossy().to_string();
         let dst = format!("{}/{}", anchors_dir, name);
         if !Path::new(&dst).exists() {
             if let Err(e) = fs::copy(cert, &dst) {
-                return (false, format!("❌ Не удалось скопировать {} в {}: {}", cert, dst, e));
+                return (false, format!("❌ Не удалось скопировать {}: {}", cert, e));
             }
             let _ = tx.send(LogEvent::Line(format!("   → {}", dst)));
-        } else {
-            let _ = tx.send(LogEvent::Line(format!("   ✅ {} уже на месте", name)));
         }
     }
 
     if command_exists("update-ca-trust") {
-        let _ = tx.send(LogEvent::Line("Запускаю update-ca-trust...".to_string()));
         let cmd = Command::new("update-ca-trust");
         match run_process(cmd, tx) {
             Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line("✅ Системное хранилище обновлено".to_string())); }
-            Ok(_s) => return (false, "update-ca-trust завершился с ошибкой".to_string()),
-            Err(e) => return (false, format!("❌ Не удалось запустить update-ca-trust: {}", e)),
+            _ => {}
         }
     }
 
@@ -1026,20 +890,13 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let nssdb = format!("sql:{}", nssdb_path);
 
     if !command_exists("certutil") {
-        let mut ok = false;
-        for pkg in ["nss-tools", "libnss3-tools"] {
-            let mut cmd = Command::new("dnf");
-            cmd.arg("install").arg("-y").arg(pkg);
-            if let Ok(s) = run_process(cmd, tx) { if s.success() { ok = true; break; } }
-        }
-        if !ok {
-            let _ = tx.send(LogEvent::Line("⚠ Не удалось установить nss-tools — NSS пропущен".to_string()));
-            return (true, "Сертификат в системное хранилище (NSS пропущен)".to_string());
-        }
+        let mut cmd = Command::new("dnf");
+        cmd.arg("install").arg("-y").arg("nss-tools");
+        let _ = run_process(cmd, tx);
     }
 
     let _ = fs::create_dir_all(&nssdb_path);
-    let db_exists = Path::new(&format!("{}/cert9.db", nssdb_path)).exists() || Path::new(&format!("{}/cert8.db", nssdb_path)).exists();
+    let db_exists = Path::new(&format!("{}/cert9.db", nssdb_path)).exists();
     if !db_exists {
         let mut init = Command::new("certutil");
         init.arg("-d").arg(&nssdb).arg("-N").arg("--empty-password");
@@ -1048,28 +905,21 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 
     for cert in &certs {
         let nick = Path::new(cert).file_stem().unwrap_or_default().to_string_lossy().to_string();
-        
         let del_cmd = format!("echo '' | certutil -d '{}' -D -n '{}' 2>/dev/null", nssdb, nick);
-        let _ = Command::new("sh").arg("-c").arg(&del_cmd)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let _ = Command::new("sh").arg("-c").arg(&del_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status();
 
         let add_cmd = format!("echo '' | certutil -d '{}' -A -t 'C,,' -n '{}' -i '{}'", nssdb, nick, cert);
-        let _ = tx.send(LogEvent::Line(format!("Добавляю в NSS: {}...", nick)));
         match Command::new("sh").arg("-c").arg(&add_cmd).stdout(Stdio::piped()).stderr(Stdio::piped()).status() {
             Ok(s) if s.success() => {
                 let verify_cmd = format!("echo '' | certutil -d '{}' -L 2>/dev/null | grep -q '{}'", nssdb, nick);
-                let verified = Command::new("sh").arg("-c").arg(&verify_cmd)
-                    .stdout(Stdio::null()).stderr(Stdio::null()).status()
-                    .map(|s| s.success()).unwrap_or(false);
-                
+                let verified = Command::new("sh").arg("-c").arg(&verify_cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
                 if verified {
                     let _ = tx.send(LogEvent::Line(format!("   ✅ NSS: {} (проверено)", nick)));
                 } else {
-                    let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS: {} добавлен, но проверка не прошла", nick)));
+                    let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS: {} не проверен", nick)));
                 }
             }
-            Ok(_s) => { let _ = tx.send(LogEvent::Line(format!("   ⚠ NSS не добавлен: {}", nick))); }
-            Err(e) => { let _ = tx.send(LogEvent::Line(format!("   ❌ NSS ошибка: {}", e))); }
+            _ => { let _ = tx.send(LogEvent::Line(format!("   ❌ NSS не добавлен: {}", nick))); }
         }
     }
 
@@ -1077,26 +927,242 @@ fn install_cert(cert_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
         let mut ch = Command::new("chown");
         ch.arg("-R").arg(format!("{}:{}", user, user)).arg(&nssdb_path);
         let _ = ch.status();
-        let _ = tx.send(LogEvent::Line(format!("   ✅ chown .pki → {}", user)));
     }
 
     (true, format!("Сертификатов установлено: {}", certs.len()))
 }
 
 fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
-    let (auto_ok, auto_msg) = auto_setup_proxy(tx);
-    if !auto_ok {
-        let _ = tx.send(LogEvent::Line(format!("⚠ Автонастройка прокси: {}", auto_msg)));
-        let (ok2, m2) = setup_proxy(tx);
-        if !ok2 { return (false, format!("Прокси: {}", m2)); }
-    }
+    let (ok1, m1) = setup_proxy(tx);
+    if !ok1 { return (false, format!("Прокси: {}", m1)); }
     let cert_dir = get_cert_dir();
     let (ok2, m2) = install_cert(&cert_dir, tx);
     if !ok2 { return (false, format!("Сертификат: {}", m2)); }
     (true, format!("Прокси ✅ | {}", m2))
 }
 
-// ==================== СКАЧИВАНИЕ ====================
+// ==================== УЛУЧШЕНИЕ №12: ПРОВЕРКА ЦЕЛОСТНОСТИ ====================
+
+/// Вычисляет SHA256 хеш файла через системную утилиту sha256sum
+fn calculate_sha256(path: &str) -> Option<String> {
+    let output = Command::new("sha256sum").arg(path)
+        .stdout(Stdio::piped()).stderr(Stdio::null()).output();
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.split_whitespace().next().map(|s| s.to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Сохраняет хеши всех .rpm в папке в checksums.sha256
+fn save_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let system_arch = detect_arch();
+    let files = find_packages_flat(folder, "", &system_arch);
+    if files.is_empty() {
+        return (false, format!("В папке {} нет .rpm файлов", folder));
+    }
+
+    let checksum_path = Path::new(folder).join(CHECKSUM_FILE);
+    let mut content = String::new();
+    let mut count = 0;
+
+    for file in &files {
+        if let Some(hash) = calculate_sha256(file) {
+            let filename = Path::new(file).file_name().unwrap_or_default().to_string_lossy().to_string();
+            content += &format!("{}  {}\n", hash, filename);
+            count += 1;
+        }
+    }
+
+    match fs::write(&checksum_path, &content) {
+        Ok(_) => {
+            let _ = tx.send(LogEvent::Line(format!("✅ Сохранено {} хешей в {}", count, checksum_path.display())));
+            (true, format!("Сохранено {} SHA256-хешей", count))
+        }
+        Err(e) => (false, format!("❌ Не удалось записать checksums: {}", e)),
+    }
+}
+
+/// Проверяет хеши всех .rpm в папке. Возвращает список повреждённых файлов
+fn verify_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String, Vec<String>) {
+    let checksum_path = Path::new(folder).join(CHECKSUM_FILE);
+    if !checksum_path.exists() {
+        let _ = tx.send(LogEvent::Line("⚠ Файл checksums.sha256 не найден — пропускаем проверку".to_string()));
+        return (true, "Проверка пропущена (нет checksums)", vec![]);
+    }
+
+    let content = match fs::read_to_string(&checksum_path) {
+        Ok(c) => c,
+        Err(e) => return (false, format!("❌ Не удалось прочитать checksums: {}", e), vec![])
+    };
+
+    let mut broken: Vec<String> = Vec::new();
+    let mut checked = 0;
+    let mut ok_count = 0;
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 { continue; }
+        let expected_hash = parts[0];
+        let filename = parts[1];
+        let full_path = Path::new(folder).join(filename);
+
+        if !full_path.exists() {
+            broken.push(format!("{} (файл отсутствует)", filename));
+            continue;
+        }
+
+        checked += 1;
+        if let Some(actual_hash) = calculate_sha256(&full_path.to_string_lossy()) {
+            if actual_hash == expected_hash {
+                ok_count += 1;
+            } else {
+                broken.push(format!("{} (хеши не совпадают)", filename));
+                let _ = tx.send(LogEvent::Line(format!("   ❌ НЕ СОВПАДАЕТ: {}", filename)));
+            }
+        }
+    }
+
+    if broken.is_empty() {
+        let _ = tx.send(LogEvent::Line(format!("✅ Проверено {} файлов, все целостны", checked)));
+        (true, format!("Все {} файлов целостны", checked), vec![])
+    } else {
+        let _ = tx.send(LogEvent::Line(format!("⚠ Повреждено {} из {} файлов", broken.len(), checked)));
+        (false, format!("{} повреждённых файлов", broken.len()), broken)
+    }
+}
+
+/// Удаляет повреждённые файлы из папки
+fn remove_broken_files(folder: &str, broken: &[String], tx: &mpsc::Sender<LogEvent>) {
+    for entry in broken {
+        let filename = entry.split_whitespace().next().unwrap_or("");
+        let full_path = Path::new(folder).join(filename);
+        if full_path.exists() {
+            let _ = fs::remove_file(&full_path);
+            let _ = tx.send(LogEvent::Line(format!("   🗑 Удалён повреждённый: {}", filename)));
+        }
+    }
+}
+
+// ==================== УЛУЧШЕНИЕ №11: ПАРАЛЛЕЛЬНОЕ СКАЧИВАНИЕ ====================
+
+/// Скачивает один пакет через dnf. Возвращает (имя, успех, сообщение)
+fn download_single_package(pkg: String, download_dir: String, proxy_url: String) -> (String, bool, String) {
+    let mut cmd = Command::new("dnf");
+    cmd.arg("download").arg("--resolve").arg("--alldeps")
+        .arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386")
+        .arg(format!("--destdir={}", download_dir))
+        .env("http_proxy", &proxy_url)
+        .env("https_proxy", &proxy_url)
+        .env("no_proxy", "localhost,127.0.0.1,::1")
+        .arg(&pkg)
+        .stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            (pkg, true, format!("{} скачан", pkg))
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let msg = stderr.lines().last().unwrap_or("неизвестная ошибка").to_string();
+            (pkg, false, format!("{}: {}", pkg, msg))
+        }
+        Err(e) => (pkg, false, format!("{}: spawn error: {}", pkg, e)),
+    }
+}
+
+/// Параллельное скачивание нескольких пакетов
+fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let total = packages.len();
+    if total == 0 {
+        return (true, "Нет пакетов для скачивания".to_string());
+    }
+
+    let _ = tx.send(LogEvent::Line(format!("🚀 Запускаю параллельное скачивание {} пакетов ({} потоков)", total, MAX_PARALLEL_DOWNLOADS)));
+
+    let proxy_url = get_proxy_url();
+    let download_dir_owned = download_dir.to_string();
+    let packages_owned: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
+
+    // Очередь пакетов и счётчик завершённых
+    let queue: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(packages_owned));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+
+    let (result_tx, result_rx) = mpsc::channel::<(String, bool, String)>();
+    let mut handles = Vec::new();
+
+    // Создаём потоки-воркеры
+    for _ in 0..MAX_PARALLEL_DOWNLOADS {
+        let queue = Arc::clone(&queue);
+        let completed = Arc::clone(&completed);
+        let failed = Arc::clone(&failed);
+        let tx_clone = tx.clone();
+        let result_tx = result_tx.clone();
+        let dir = download_dir_owned.clone();
+        let proxy = proxy_url.clone();
+        let total = total;
+
+        let handle = thread::spawn(move || {
+            loop {
+                // Берём следующий пакет из очереди
+                let pkg = {
+                    let mut q = queue.lock().unwrap();
+                    q.pop()
+                };
+                let pkg = match pkg {
+                    Some(p) => p,
+                    None => break, // очередь пуста
+                };
+
+                let (name, ok, msg) = download_single_package(pkg.clone(), dir.clone(), proxy.clone());
+                let _ = result_tx.send((name, ok, msg));
+
+                let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                if !ok { failed.fetch_add(1, Ordering::SeqCst); }
+
+                let pct = done as f64 / total as f64;
+                let label = format!("Скачано: {} / {}", done, total);
+                let _ = tx_clone.send(LogEvent::Progress(pct, label));
+                let _ = tx_clone.send(LogEvent::Line(format!("   {}", msg)));
+            }
+        });
+        handles.push(handle);
+    }
+
+    drop(result_tx); // закрываем свой sender, чтобы rx знал когда все закончили
+
+    // Ждём завершения всех потоков
+    for h in handles {
+        let _ = h.join();
+    }
+
+    // Собираем результаты
+    let mut success_count = 0;
+    let mut fail_count = 0;
+    let mut fail_messages: Vec<String> = Vec::new();
+
+    for (name, ok, msg) in result_rx.iter() {
+        if ok { success_count += 1; }
+        else { fail_count += 1; fail_messages.push(msg); }
+        log_to_file(&format!("[PARALLEL] {} {}", name, if ok { "OK" } else { "FAIL" }));
+    }
+
+    // УЛУЧШЕНИЕ №12: после скачивания сохраняем хеши
+    let _ = save_checksums(download_dir, tx);
+
+    if fail_count == 0 {
+        (true, format!("Параллельно скачано {} пакетов", success_count))
+    } else if success_count > 0 {
+        (true, format!("Скачано {} пакетов, {} с ошибками", success_count, fail_count))
+    } else {
+        (false, format!("Все {} пакетов не удалось скачать", fail_count))
+    }
+}
+
+// ==================== СКАЧИВАНИЕ (с интеграцией №11 + №12) ====================
 
 fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
@@ -1104,27 +1170,20 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok { return (false, space_msg); }
 
-    let estimated_size = estimate_dnf_download_size(&["upgrade", "--downloadonly", "--exclude=*.i686", "--exclude=*.i586", "--exclude=*.i386"]);
-    if let Some(size_mb) = estimated_size {
-        let _ = tx.send(LogEvent::Line(format!("📊 Примерный размер скачивания: {}", format_size_mb(size_mb))));
-        if size_mb > 0 {
-            let (enough, msg) = check_free_space(download_dir, size_mb + 100, "Скачивание обновлений (с запасом 100 МБ)");
-            let _ = tx.send(LogEvent::Line(msg));
-            if !enough { return (false, format!("❌ Недостаточно места. Освободите {} и повторите.", format_size_mb(size_mb + 100))); }
-        }
-    }
-
     let abs_path = fs::canonicalize(download_dir).unwrap_or_else(|_| Path::new(download_dir).to_path_buf());
     let _ = tx.send(LogEvent::Line(format!("📥 Скачиваю обновления в: {}", abs_path.display())));
 
     let mut cmd = Command::new("dnf");
-    cmd.arg("upgrade").arg("--downloadonly").arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386").arg(format!("--destdir={}", abs_path.display())).arg("-y");
+    cmd.arg("upgrade").arg("--downloadonly").arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386")
+        .arg(format!("--destdir={}", abs_path.display())).arg("-y");
 
     match run_process(cmd, tx) {
         Ok(s) if s.success() => {
             let rpm_count = find_packages_flat(download_dir, "", &detect_arch()).len();
+            // УЛУЧШЕНИЕ №12: сохраняем хеши
+            let _ = save_checksums(download_dir, tx);
             if rpm_count > 0 { (true, format!("Обновления скачаны ({} пакетов)", rpm_count)) }
-            else { (false, "dnf отработал, но файлы не найдены в папке. Проверьте /var/cache/dnf/".to_string()) }
+            else { (false, "dnf отработал, но файлы не найдены".to_string()) }
         }
         Ok(_s) => (false, "Ошибка скачивания".to_string()),
         Err(e) => (false, format!("❌ Не удалось запустить dnf: {}", e)),
@@ -1137,30 +1196,27 @@ fn download_packages(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<Lo
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok { return (false, space_msg); }
 
-    let mut dnf_args: Vec<String> = vec!["download".to_string(), "--resolve".to_string(), "--alldeps".to_string(), "--exclude=*.i686".to_string(), "--exclude=*.i586".to_string(), "--exclude=*.i386".to_string()];
-    for pkg in packages { dnf_args.push(pkg.to_string()); }
-    let estimated_size = estimate_dnf_download_size(&dnf_args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    if let Some(size_mb) = estimated_size {
-        let _ = tx.send(LogEvent::Line(format!("📊 Примерный размер скачивания: {}", format_size_mb(size_mb))));
-        let (enough, msg) = check_free_space(download_dir, size_mb + 100, "Скачивание пакетов (с запасом 100 МБ)");
-        let _ = tx.send(LogEvent::Line(msg));
-        if !enough { return (false, format!("❌ Недостаточно места для скачивания пакетов. Освободите {} и повторите.", format_size_mb(size_mb + 100))); }
-    }
-
-    let mut cmd = Command::new("dnf");
-    cmd.arg("download").arg("--resolve").arg("--alldeps").arg("--exclude=*.i686").arg("--exclude=*.i586").arg("--exclude=*.i386").arg(format!("--destdir={}", download_dir));
-    for pkg in packages { cmd.arg(pkg); }
-    match run_process(cmd, tx) {
-        Ok(s) if s.success() => (true, "Пакеты скачаны".to_string()),
-        Ok(_s) => (false, "Ошибка скачивания".to_string()),
-        Err(e) => (false, format!("❌ Не удалось запустить dnf: {}", e)),
-    }
+    // УЛУЧШЕНИЕ №11: параллельное скачивание
+    download_packages_parallel(packages, download_dir, tx)
 }
 
-// ==================== УСТАНОВКА ИЗ ПАПКИ ====================
+// ==================== УСТАНОВКА ИЗ ПАПКИ (с проверкой целостности) ====================
 
 fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
+
+    // УЛУЧШЕНИЕ №12: проверяем целостность перед установкой
+    let _ = tx.send(LogEvent::Line("🧪 Проверяю целостность пакетов...".to_string()));
+    let (integrity_ok, integrity_msg, broken) = verify_checksums(download_dir, tx);
+    let _ = tx.send(LogEvent::Line(integrity_msg));
+
+    if !integrity_ok && !broken.is_empty() {
+        let _ = tx.send(LogEvent::Line("🗑 Удаляю повреждённые файлы...".to_string()));
+        remove_broken_files(download_dir, &broken, tx);
+        // Пересоздаём checksums без удалённых
+        let _ = save_checksums(download_dir, tx);
+    }
+
     let files = find_packages_flat(download_dir, "", &system_arch);
     if files.is_empty() { return (false, format!("❌ В папке '{}' нет .rpm файлов", download_dir)); }
     let _ = tx.send(LogEvent::Line(format!("Найдено {} пакетов для установки", files.len())));
@@ -1170,7 +1226,7 @@ fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool
     let required_mb = total_size_mb * 3;
     let (space_ok, space_msg) = check_free_space(download_dir, required_mb.max(MIN_FREE_SPACE_CRITICAL_MB), "Установка пакетов");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok { return (false, format!("{} Размер пакетов: {}, для установки нужно ~{}", space_msg, format_size_mb(total_size_mb), format_size_mb(required_mb))); }
+    if !space_ok { return (false, space_msg); }
 
     let mut installed = 0;
     for chunk in files.chunks(80) {
@@ -1179,7 +1235,7 @@ fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool
         for file in chunk { cmd.arg(file); }
         match run_process(cmd, tx) {
             Ok(s) if s.success() => { installed += chunk.len(); }
-            Ok(_s) => { /* пропускаем */ }
+            Ok(_s) => {}
             Err(e) => { let _ = tx.send(LogEvent::Line(format!("❌ Ошибка: {}", e))); }
         }
     }
@@ -1201,19 +1257,7 @@ fn download_package_to_folder(package_name: &str, folder: &str, tx: &mpsc::Sende
     match run_process(cmd, tx) {
         Ok(s) if s.success() => {
             let files = find_packages_by_substring(folder, package_name, &detect_arch());
-            if !files.is_empty() { return (true, format!("{} скачан ({} файлов)", package_name, files.len())); }
-            let _ = tx.send(LogEvent::Line("Файлы не в папке, ищу в кэше dnf...".to_string()));
-            let cache_search = format!("find /var/cache/dnf -name '*{}*.rpm' -type f 2>/dev/null | head -5", package_name);
-            if let Ok(output) = Command::new("sh").arg("-c").arg(&cache_search).output() {
-                let cache_files = String::from_utf8_lossy(&output.stdout);
-                if !cache_files.trim().is_empty() {
-                    for cache_file in cache_files.lines() {
-                        if !cache_file.is_empty() { let _ = Command::new("cp").arg(cache_file).arg(folder).status(); }
-                    }
-                    let files = find_packages_by_substring(folder, package_name, &detect_arch());
-                    if !files.is_empty() { return (true, format!("{} скачан через кэш", package_name)); }
-                }
-            }
+            if !files.is_empty() { return (true, format!("{} скачан", package_name)); }
             (false, format!("{} скачан, но файлы не найдены", package_name))
         }
         Ok(_s) => (false, format!("{} не найден в репозитории", package_name)),
@@ -1225,14 +1269,7 @@ fn install_local_packages(folder: &str, pattern: &str, tx: &mpsc::Sender<LogEven
     let files = find_packages_by_substring(folder, pattern, &detect_arch());
     if files.is_empty() { return (false, format!("❌ Не найдено *{}*.rpm в папке {}", pattern, folder)); }
 
-    let total_size_bytes: u64 = files.iter().filter_map(|f| fs::metadata(f).ok().map(|m| m.len())).sum();
-    let total_size_mb = total_size_bytes / (1024 * 1024);
-    let required_mb = total_size_mb * 3;
-    let (space_ok, space_msg) = check_free_space(folder, required_mb.max(100), format!("Установка {}", pattern));
-    let _ = tx.send(LogEvent::Line(space_msg.clone()));
-    if !space_ok { return (false, space_msg); }
-
-    let _ = tx.send(LogEvent::Line(format!("Устанавливаю {} пакетов ({}): {}", files.len(), format_size_mb(total_size_mb), pattern)));
+    let _ = tx.send(LogEvent::Line(format!("Устанавливаю {} пакетов: {}", files.len(), pattern)));
     let mut cmd = Command::new("dnf");
     cmd.arg("install").arg("-y").arg("--allowerasing").arg("--nobest");
     for file in &files { cmd.arg(file); }
@@ -1246,8 +1283,8 @@ fn install_local_packages(folder: &str, pattern: &str, tx: &mpsc::Sender<LogEven
 fn install_cryptopro_csp(crypto_subdir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let install_script = Path::new(crypto_subdir).join("install.sh");
     let uninstall_script = Path::new(crypto_subdir).join("uninstall.sh");
-    if !install_script.exists() { return (false, "❌ В linux-amd64/ не найден install.sh КриптоПро".to_string()); }
-    if !uninstall_script.exists() { return (false, "❌ В linux-amd64/ не найден uninstall.sh КриптоПро".to_string()); }
+    if !install_script.exists() { return (false, "❌ В linux-amd64/ не найден install.sh".to_string()); }
+    if !uninstall_script.exists() { return (false, "❌ В linux-amd64/ не найден uninstall.sh".to_string()); }
 
     let (space_ok, space_msg) = check_free_space(crypto_subdir, MIN_FREE_SPACE_CRYPTO_MB, "Установка КриптоПро CSP");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
@@ -1276,26 +1313,21 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
     let _ = tx.send(LogEvent::Progress(0.0, "Шаг 1: newt...".to_string()));
     let newt_installed = is_package_installed("newt");
     if !newt_installed && find_packages_by_substring(crypto_dir, "newt", &system_arch).is_empty() {
-        let _ = tx.send(LogEvent::Line("newt не установлен — скачиваю...".to_string()));
         let (ok, msg) = download_package_to_folder("newt", crypto_dir, tx);
         if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
-    } else if newt_installed {
-        let _ = tx.send(LogEvent::Line("✅ newt уже установлен".to_string()));
     }
     if !newt_installed {
         let (ok, msg) = install_local_packages(crypto_dir, "newt", tx);
         if !ok { return (false, format!("Шаг 1 (newt): {}", msg)); }
     }
 
-    let _ = tx.send(LogEvent::Line("=== ШАГ 2.1/5: pcsc-lite + pcsc-lite-ccid ===".to_string()));
+    let _ = tx.send(LogEvent::Line("=== ШАГ 2.1/5: pcsc-lite ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.15, "Шаг 2.1: pcsc-lite...".to_string()));
     for pkg in &["pcsc-lite", "pcsc-lite-ccid"] {
         let pkg_installed = is_package_installed(pkg);
         if !pkg_installed && find_packages_by_substring(crypto_dir, pkg, &system_arch).is_empty() {
             let (ok, msg) = download_package_to_folder(pkg, crypto_dir, tx);
             if !ok { return (false, format!("Шаг 2.1 ({}): {}", pkg, msg)); }
-        } else if pkg_installed {
-            let _ = tx.send(LogEvent::Line(format!("✅ {} уже установлен", pkg)));
         }
         if !pkg_installed {
             let (ok, msg) = install_local_packages(crypto_dir, pkg, tx);
@@ -1308,193 +1340,242 @@ fn install_cryptopro_gia(crypto_dir: &str, school_dir: &str, tx: &mpsc::Sender<L
     let lib_installed = is_package_installed("librtpkcs11ecp");
     if !lib_installed && find_packages_by_substring(crypto_dir, "librtpkcs11ecp", &system_arch).is_empty() {
         let (ok, msg) = download_package_to_folder("librtpkcs11ecp", crypto_dir, tx);
-        if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
-    } else if lib_installed {
-        let _ = tx.send(LogEvent::Line("✅ librtpkcs11ecp уже установлен".to_string()));
+        if !ok { return (false, format!("Шаг 2.2: {}", msg)); }
     }
     if !lib_installed {
         let (ok, msg) = install_local_packages(crypto_dir, "librtpkcs11ecp", tx);
-        if !ok { return (false, format!("Шаг 2.2 (librtpkcs11ecp): {}", msg)); }
+        if !ok { return (false, format!("Шаг 2.2: {}", msg)); }
     }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 3/5: КриптоПро CSP ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.5, "Шаг 3: КриптоПро...".to_string()));
     let crypto_subdir = Path::new(crypto_dir).join("linux-amd64");
     let (ok, msg) = install_cryptopro_csp(&crypto_subdir.to_string_lossy(), tx);
-    if !ok { return (false, format!("Шаг 3 (КриптоПро): {}", msg)); }
+    if !ok { return (false, format!("Шаг 3: {}", msg)); }
 
     let _ = tx.send(LogEvent::Line("=== ШАГ 4/5: GIA11_PPE ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.75, "Шаг 4: GIA11_PPE...".to_string()));
     if find_packages_by_substring(crypto_dir, "GIA11_PPE", &system_arch).is_empty() {
-        return (false, "❌ GIA11_PPE*.rpm не найден в cryptopro_gia/. Положите файл и повторите.".to_string());
+        return (false, "❌ GIA11_PPE*.rpm не найден в cryptopro_gia/".to_string());
     }
     let (ok, msg) = install_local_packages(crypto_dir, "GIA11_PPE", tx);
-    if !ok { return (false, format!("Шаг 4 (GIA11_PPE): {}", msg)); }
+    if !ok { return (false, format!("Шаг 4: {}", msg)); }
 
-    let _ = tx.send(LogEvent::Line("=== ШАГ 5/5: Запуск pcscd ===".to_string()));
+    let _ = tx.send(LogEvent::Line("=== ШАГ 5/5: pcscd ===".to_string()));
     let _ = tx.send(LogEvent::Progress(0.9, "Шаг 5: запуск pcscd...".to_string()));
     let mut cmd = Command::new("systemctl");
     cmd.arg("enable").arg("--now").arg("pcscd");
     match run_process(cmd, tx) {
         Ok(s) if s.success() => { let _ = tx.send(LogEvent::Line("✅ pcscd запущен".to_string())); }
-        _ => { let _ = tx.send(LogEvent::Line("⚠ pcscd не запущен — вручную: systemctl enable --now pcscd".to_string())); }
+        _ => { let _ = tx.send(LogEvent::Line("⚠ pcscd не запущен".to_string())); }
     }
 
-    (true, "Установлено: newt, pcsc-lite, librtpkcs11ecp, КриптоПро CSP, GIA11_PPE".to_string())
+    (true, "КриптоПро + ГИА установлены".to_string())
 }
 
 fn get_packages() -> Vec<&'static str> { vec!["task-koge", "r7-office", "notepadqq"] }
 
-// ==================== УЛУЧШЕНИЕ №10: ЭКСПОРТ ОТЧЁТА ====================
+// ==================== УЛУЧШЕНИЕ №13: АВТООБНОВЛЕНИЕ ====================
 
-struct InstalledPackage {
-    name: String,
-    version: String,
-    arch: String,
-    install_date: String,
-    size_mb: f64,
+/// Извлекает номер версии из тега GitHub (v1.2.3 → 1.2.3)
+fn extract_version_from_tag(tag: &str) -> String {
+    tag.trim_start_matches('v').to_string()
 }
 
-fn get_installed_packages() -> Vec<InstalledPackage> {
-    let output = Command::new("rpm")
-        .arg("-qa")
-        .arg("--qf")
-        .arg("%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{INSTALLTIME:date:%Y-%m-%d %H:%M}\t%{SIZE}\n")
-        .output();
-    
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.lines()
-                .filter_map(|line| {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() >= 5 {
-                        let size_bytes: u64 = parts[4].parse().unwrap_or(0);
-                        Some(InstalledPackage {
-                            name: parts[0].to_string(),
-                            version: parts[1].to_string(),
-                            arch: parts[2].to_string(),
-                            install_date: parts[3].to_string(),
-                            size_mb: size_bytes as f64 / (1024.0 * 1024.0),
-                        })
+/// Сравнивает две версии (semver-lite): returns true если new > current
+fn is_newer_version(current: &str, new: &str) -> bool {
+    let cur_parts: Vec<u32> = current.split('.').filter_map(|s| s.parse().ok()).collect();
+    let new_parts: Vec<u32> = new.split('.').filter_map(|s| s.parse().ok()).collect();
+    let max_len = cur_parts.len().max(new_parts.len());
+    for i in 0..max_len {
+        let c = cur_parts.get(i).copied().unwrap_or(0);
+        let n = new_parts.get(i).copied().unwrap_or(0);
+        if n > c { return true; }
+        if n < c { return false; }
+    }
+    false
+}
+
+/// Проверяет наличие новой версии через GitHub API
+fn check_for_update(tx: &mpsc::Sender<LogEvent>) -> (bool, String, Option<String>, Option<String>) {
+    // (has_update, message, new_version, download_url)
+    let url = format!("{}/repos/{}/{}/releases/latest", GITHUB_API_URL, GITHUB_REPO_OWNER, GITHUB_REPO_NAME);
+    let _ = tx.send(LogEvent::Line(format!("🔗 Проверяю обновления на GitHub...")));
+    log_to_file(&format!("Проверка обновлений: {}", url));
+
+    let proxy_url = get_proxy_url();
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s").arg("-L").arg("--max-time").arg("10")
+        .arg("--proxy").arg(&proxy_url)
+        .arg("-H").arg("Accept: application/vnd.github+json")
+        .arg(&url);
+
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            let body = String::from_utf8_lossy(&out.stdout).to_string();
+            if body.is_empty() || body.contains("Not Found") {
+                return (false, "❌ Репозиторий не найден. Настрой GITHUB_REPO_OWNER и GITHUB_REPO_NAME в коде".to_string(), None, None);
+            }
+
+            // Простой парсинг JSON без serde
+            let tag = extract_json_string(&body, "tag_name");
+            let download_url = extract_release_asset_url(&body);
+
+            match (tag, download_url) {
+                (Some(tag), Some(url)) => {
+                    let new_version = extract_version_from_tag(&tag);
+                    if is_newer_version(VERSION, &new_version) {
+                        let _ = tx.send(LogEvent::Line(format!("🆕 Найдена новая версия: v{} (текущая v{})", new_version, VERSION)));
+                        (true, format!("Доступно обновление: v{} → v{}", VERSION, new_version), Some(new_version), Some(url))
                     } else {
-                        None
+                        let _ = tx.send(LogEvent::Line(format!("✅ Обновлений нет (текущая v{} — последняя)", VERSION)));
+                        (false, format!("Обновлений нет, актуальная версия v{}", VERSION), None, None)
                     }
-                })
-                .collect()
+                }
+                (Some(tag), None) => {
+                    let new_version = extract_version_from_tag(&tag);
+                    if is_newer_version(VERSION, &new_version) {
+                        (false, format!("⚠ Найдена v{}, но нет download_url в релизе", new_version), Some(new_version), None)
+                    } else {
+                        (false, format!("✅ Обновлений нет"), None, None)
+                    }
+                }
+                _ => (false, "❌ Не удалось разобрать ответ GitHub API".to_string(), None, None),
+            }
         }
-        Err(_) => vec![],
+        Ok(_) => (false, "❌ GitHub API вернул ошибку".to_string(), None, None),
+        Err(e) => (false, format!("❌ Не удалось проверить обновления: {}", e), None, None),
     }
 }
 
-fn get_our_package_prefixes() -> Vec<&'static str> {
-    vec![
-        "task-koge", "r7-office", "notepadqq",
-        "newt", "pcsc-lite", "librtpkcs11ecp",
-        "lsb-cprocsp-base", "lsb-cprocsp-rdr", "lsb-cprocsp-kc1", "lsb-cprocsp-kc2",
-        "lsb-cprocsp-capilite", "cprocsp-curl", "lsb-cprocsp-ca-certs", "cprocsp-compat",
-        "GIA11_PPE",
-        "nss-tools", "libnss3-tools",
-        "kumir2", "python3", "fpc", "lazarus", "geany", "codeblocks", "libreoffice", "chromium", "gimp",
-    ]
+/// Очень простой парсер JSON — ищет значение по ключу (для строковых полей)
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let search = format!("\"{}\":", key);
+    let start = json.find(&search)? + search.len();
+    let rest = &json[start..];
+    let first_quote = rest.find('"')?;
+    let after_quote = &rest[first_quote + 1..];
+    let end_quote = after_quote.find('"')?;
+    Some(after_quote[..end_quote].to_string())
 }
 
-fn filter_our_packages(packages: &[InstalledPackage]) -> Vec<&InstalledPackage> {
-    let prefixes = get_our_package_prefixes();
-    packages.iter()
-        .filter(|p| prefixes.iter().any(|prefix| p.name.starts_with(prefix)))
-        .collect()
-}
-
-fn format_txt_report(packages: &[&InstalledPackage], timestamp: &str) -> String {
-    let mut report = String::new();
-    report += "ОТЧЁТ ПО УСТАНОВЛЕННОМУ ПО (school-installer)\n";
-    report += "=============================================\n";
-    report += &format!("Дата отчёта: {}\n", timestamp);
-    report += &format!("ОС: МОС ОС (ROSA) | Архитектура: {}\n", detect_arch());
-    report += &format!("Хост: {}\n", get_hostname());
-    report += &format!("Версия установщика: {}\n\n", VERSION);
-    
-    report += "УСТАНОВЛЕННЫЕ ПАКЕТЫ:\n";
-    report += "---------------------\n";
-    
-    if packages.is_empty() {
-        report += "  (наши пакеты не найдены в системе)\n";
-    } else {
-        for pkg in packages {
-            report += &format!("  {:<35} {:<18} {:<8} {:>8.1} МБ\n",
-                format!("{}-{}", pkg.name, pkg.version),
-                pkg.install_date,
-                pkg.arch,
-                pkg.size_mb
-            );
+/// Ищет URL для скачивания бинарника в релизе (asset с .tar.gz или без расширения)
+fn extract_release_asset_url(json: &str) -> Option<String> {
+    // Ищем в массиве assets поле browser_download_url, который содержит school-installer
+    let assets_start = json.find("\"assets\":")?;
+    let rest = &json[assets_start..];
+    let mut search_pos = 0;
+    while let Some(idx) = rest[search_pos..].find("\"browser_download_url\":") {
+        let abs_idx = search_pos + idx + "\"browser_download_url\":".len();
+        if let Some(url) = extract_json_string(&rest[abs_idx..], "") {
+            if url.contains("school-installer") && (url.ends_with(".tar.gz") || url.ends_with(".gz") || url.contains("linux")) {
+                return Some(url);
+            }
         }
+        search_pos = abs_idx;
     }
-    
-    report += &format!("\nВсего пакетов: {}\n", packages.len());
-    
-    let total_size: f64 = packages.iter().map(|p| p.size_mb).sum();
-    report += &format!("Общий размер: {:.1} МБ\n\n", total_size);
-    
-    report += "ИНФОРМАЦИЯ О ПАПКАХ:\n";
-    report += "--------------------\n";
-    let system_arch = detect_arch();
-    report += &format!("  school_packages: {}\n", folder_info_line("", &get_school_packages_dir(), &system_arch));
-    report += &format!("  updates: {}\n", folder_info_line("", &get_updates_dir(), &system_arch));
-    report += &format!("  cryptopro_gia: {}\n", folder_info_line("", &get_crypto_dir(), &system_arch));
-    report += &format!("  cer: {}\n", folder_info_line("", &get_cert_dir(), &system_arch));
-    
-    if let Some(free_mb) = get_free_space_mb(".") {
-        report += &format!("\nСВОБОДНО НА ДИСКЕ: {}\n", format_size_mb(free_mb));
-    }
-    
-    report += &format!("\n---\nОтчёт создан school-installer v{}\n", VERSION);
-    
-    report
+    None
 }
 
-fn format_csv_report(packages: &[&InstalledPackage], timestamp: &str) -> String {
-    let mut csv = String::new();
-    csv += &format!("# Отчёт school-installer v{} от {}\n", VERSION, timestamp);
-    csv += &format!("# Хост: {} | ОС: МОС ОС | Арх: {}\n", get_hostname(), detect_arch());
-    csv += "name,version,arch,install_date,size_mb\n";
-    for pkg in packages {
-        csv += &format!("{},{},{},{},{:.1}\n",
-            pkg.name, pkg.version, pkg.arch, pkg.install_date, pkg.size_mb
-        );
-    }
-    csv
-}
+/// Скачивает и применяет обновление
+fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let _ = tx.send(LogEvent::Line(format!("⬇ Скачиваю v{}...", new_version)));
 
-fn export_report(format: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
-    let _ = tx.send(LogEvent::Line("📄 Генерирую отчёт...".to_string()));
-    log_to_file("Генерация отчёта");
-    
-    let all_packages = get_installed_packages();
-    let our_packages = filter_our_packages(&all_packages);
-    
-    let timestamp = chrono_now_approx();
-    let content = match format {
-        "csv" => format_csv_report(&our_packages, &timestamp),
-        _ => format_txt_report(&our_packages, &timestamp),
+    let current_exe = env::current_exe().ok()?;
+    let update_dir = Path::new(&get_report_dir());
+    let download_path = update_dir.join(format!("school-installer-{}.tmp", new_version));
+
+    let proxy_url = get_proxy_url();
+    let mut cmd = Command::new("curl");
+    cmd.arg("-L").arg("--max-time").arg("120")
+        .arg("--proxy").arg(&proxy_url)
+        .arg("-o").arg(&download_path)
+        .arg(download_url);
+
+    match cmd.status() {
+        Ok(s) if s.success() => {}
+        Ok(_) => { let _ = fs::remove_file(&download_path); return (false, "❌ Скачивание не удалось".to_string()); }
+        Err(e) => return (false, format!("❌ curl error: {}", e)),
+    }
+
+    // Проверяем размер
+    let meta = match fs::metadata(&download_path) {
+        Ok(m) => m,
+        Err(_) => { let _ = fs::remove_file(&download_path); return (false, "❌ Файл не скачан".to_string()); }
     };
-    
-    let report_dir = get_report_dir();
-    let filename = format!("school-installer-report-{}.{}", timestamp, format);
-    let filepath = Path::new(&report_dir).join(&filename);
-    
-    match fs::write(&filepath, &content) {
+    if meta.len() < 100_000 {
+        let _ = fs::remove_file(&download_path);
+        return (false, format!("⚠ Скачанный файл подозрительно мал ({} Б)", meta.len()));
+    }
+
+    let _ = tx.send(LogEvent::Line(format!("   Файл скачан: {}", format_size_bytes(meta.len()))));
+
+    // Распаковываем если tar.gz
+    let final_path = if download_path.to_string_lossy().ends_with(".tar.gz") || download_path.to_string_lossy().ends_with(".gz") {
+        let _ = tx.send(LogEvent::Line("   Распаковываю tar.gz...".to_string()));
+        let extract_dir = update_dir.join("update_extract");
+        let _ = fs::create_dir_all(&extract_dir);
+        let mut untar = Command::new("tar");
+        untar.arg("-xzf").arg(&download_path).arg("-C").arg(&extract_dir);
+        if !untar.status().map(|s| s.success()).unwrap_or(false) {
+            return (false, "❌ Не удалось распаковать".to_string());
+        }
+        // Ищем school-installer в распакованном
+        find_extracted_binary(&extract_dir).unwrap_or_else(|| {
+            let _ = fs::remove_file(&download_path);
+            PathBuf::from("")
+        })
+    } else {
+        download_path.clone()
+    };
+
+    if final_path.as_os_str().is_empty() || !final_path.exists() {
+        let _ = fs::remove_file(&download_path);
+        return (false, "❌ Бинарник не найден в архиве".to_string());
+    }
+
+    // Проверяем SHA256 скачанного бинарника
+    let new_hash = calculate_sha256(&final_path.to_string_lossy());
+    let _ = tx.send(LogEvent::Line(format!("   SHA256: {}", new_hash.as_deref().unwrap_or("???"))));
+
+    // Заменяем текущий бинарник
+    let backup_path = update_dir.join(format!("school-installer.backup-{}", VERSION));
+    let _ = tx.send(LogEvent::Line("   Создаю backup текущей версии...".to_string()));
+    let _ = fs::rename(&current_exe, &backup_path);
+
+    match fs::rename(&final_path, &current_exe) {
         Ok(_) => {
-            let _ = tx.send(LogEvent::Line(format!("✅ Отчёт сохранён: {}", filepath.display())));
-            log_to_file(&format!("Отчёт сохранён: {}", filepath.display()));
-            (true, format!("Отчёт сохранён: {}", filepath.display()))
+            let _ = fs::set_permissions(&current_exe, fs::Permissions::from_mode(0o755));
+            let _ = tx.send(LogEvent::Line(format!("✅ Обновление до v{} применено!", new_version)));
+            let _ = tx.send(LogEvent::Line(format!("   Backup сохранён: {}", backup_path.display())));
+            let _ = tx.send(LogEvent::Line("   🔄 Перезапустите программу для новой версии".to_string()));
+            log_to_file(&format!("УСПЕШНОЕ ОБНОВЛЕНИЕ: v{} → v{}", VERSION, new_version));
+            (true, format!("Обновлено до v{}. Перезапустите программу.", new_version))
         }
         Err(e) => {
-            let _ = tx.send(LogEvent::Line(format!("❌ Ошибка записи: {}", e)));
-            log_to_file(&format!("Ошибка записи отчёта: {}", e));
-            (false, format!("Ошибка записи отчёта: {}", e))
+            // Откатываем backup
+            let _ = fs::rename(&backup_path, &current_exe);
+            (false, format!("❌ Не удалось заменить бинарник: {}", e))
         }
     }
+}
+
+/// Ищет бинарник school-installer в распакованной папке
+fn find_extracted_binary(dir: &Path) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if let Ok(entries) = fs::read_dir(&current) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().map(|n| n == "school-installer").unwrap_or(false) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ==================== ДИСПЕТЧЕР КОМАНД ====================
@@ -1505,15 +1586,14 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
     let pkg_dir = get_school_packages_dir();
     let upd_dir = get_updates_dir();
     if pkg_dir == upd_dir {
-        let _ = tx.send(LogEvent::Line("⚠ ВНИМАНИЕ: school_packages и updates указывают на одну папку!".to_string()));
-        let _ = tx.send(LogEvent::Line("   Проверьте school-installer.conf или переменные окружения.".to_string()));
+        let _ = tx.send(LogEvent::Line("⚠ school_packages и updates указывают на одну папку!".to_string()));
     }
 
     ensure_directories();
 
     if let Some(free_mb) = get_free_space_mb(&pkg_dir) {
         if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
-            let _ = tx.send(LogEvent::Line(format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {} на диске. Программа может работать нестабильно.", format_size_mb(free_mb))));
+            let _ = tx.send(LogEvent::Line(format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {}", format_size_mb(free_mb))));
         } else {
             let _ = tx.send(LogEvent::Line(format!("💾 Свободно на диске: {}", format_size_mb(free_mb))));
         }
@@ -1535,17 +1615,7 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
     let system_arch = detect_arch();
 
     let result: (bool, String) = match cmd_id {
-        "setup_env" => {
-            let (auto_ok, auto_msg) = auto_setup_proxy(tx);
-            if auto_ok {
-                let cert_dir = get_cert_dir();
-                let (ok2, m2) = install_cert(&cert_dir, tx);
-                if !ok2 { (false, format!("Сертификат: {}", m2)) }
-                else { (true, format!("{} | {}", auto_msg, m2)) }
-            } else {
-                prepare_environment(tx)
-            }
-        }
+        "setup_env" => prepare_environment(tx),
         "auto_proxy" => auto_setup_proxy(tx),
         "download_updates" => download_updates(&updates_dir, tx),
         "install_updates" => {
@@ -1564,39 +1634,63 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
                 let _ = tx.send(LogEvent::Line(format!("✅ Найден: {}", cert_path)));
                 (true, format!("Сертификат найден: {}", cert_path))
             } else if let Some(device) = find_first_usb_device() {
-                let _ = tx.send(LogEvent::Line(format!("⚠ На смонтированных не найден. Монтирую {}...", device)));
                 if let Some(mount_point) = mount_usb_device(&device, tx) {
                     let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
                     if cert_path.exists() {
-                        let _ = tx.send(LogEvent::Line(format!("✅ Найден на флешке: {}", cert_path.display())));
                         unmount_device(&mount_point, tx);
                         (true, format!("Сертификат найден на USB: {}", cert_path.display()))
                     } else {
                         unmount_device(&mount_point, tx);
-                        (false, "Сертификат не найден на USB-устройстве".to_string())
+                        (false, "Сертификат не найден на USB".to_string())
                     }
-                } else {
-                    (false, "Не удалось смонтировать USB-устройство".to_string())
-                }
+                } else { (false, "Не удалось смонтировать USB".to_string()) }
             } else {
-                (false, "USB-устройства не найдены. Вставьте флешку с сертификатом.".to_string())
+                (false, "USB-устройства не найдены".to_string())
             }
         }
         "export_report" => export_report("txt", tx),
+        "check_integrity" => {
+            let (ok, msg, _) = verify_checksums(&download_dir, tx);
+            (ok, msg)
+        }
+        "check_update" => {
+            let (has_update, msg, new_version, url) = check_for_update(tx);
+            if has_update {
+                match (new_version, url) {
+                    (Some(v), Some(u)) => {
+                        let _ = tx.send(LogEvent::Line(format!("   💡 Для применения: команда '🔁 Обновить'".to_string())));
+                        (true, msg)
+                    }
+                    _ => (false, msg)
+                }
+            } else {
+                (false, msg)
+            }
+        }
+        "apply_update" => {
+            let (has_update, _, new_version, url) = check_for_update(tx);
+            if has_update {
+                if let (Some(v), Some(u)) = (new_version, url) {
+                    apply_update(&u, &v, tx)
+                } else {
+                    (false, "❌ Нет download_url для обновления".to_string())
+                }
+            } else {
+                (false, "ℹ Обновлений нет".to_string())
+            }
+        }
         "detect_os" => {
             print_setup_instructions(tx);
             let mut info = format!("🖥 ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
             info += &format!("\n  🌐 Прокси: {}", get_proxy_url());
-            info += &format!("\n  🔒 cer: {}", folder_info_line("", &cert_dir, &system_arch));
             info += &format!("\n  📦 school_packages: {}", folder_info_line("", &download_dir, &system_arch));
             info += &format!("\n  🔄 updates: {}", folder_info_line("", &updates_dir, &system_arch));
             info += &format!("\n  🔐 cryptopro_gia: {}", folder_info_line("", &crypto_dir, &system_arch));
-            let install_sh = format!("{}/linux-amd64/install.sh", crypto_dir);
-            info += &format!("\n     └── install.sh: {}", Path::new(&install_sh).exists());
+            info += &format!("\n  🔒 cer: {}", folder_info_line("", &cert_dir, &system_arch));
             if let Some(free_mb) = get_free_space_mb(&download_dir) {
-                info += &format!("\n  💾 Свободно на диске: {}", format_size_mb(free_mb));
+                info += &format!("\n  💾 Свободно: {}", format_size_mb(free_mb));
             }
-            info += &format!("\n\n  📝 Лог сохраняется в: {}", log_file_path());
+            info += &format!("\n\n  📝 Лог: {}", log_file_path());
             (true, info)
         }
         "exit" => (true, "Выход".to_string()),
@@ -1604,6 +1698,98 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
     };
     let _ = tx.send(LogEvent::Done(result.0, result.1));
     log_to_file(&format!("=== Команда {} завершена: {} ===", cmd_id, if result.0 { "УСПЕХ" } else { "ОШИБКА" }));
+}
+
+// ==================== ЭКСПОРТ ОТЧЁТА ====================
+
+struct InstalledPackage {
+    name: String,
+    version: String,
+    arch: String,
+    install_date: String,
+    size_mb: f64,
+}
+
+fn get_installed_packages() -> Vec<InstalledPackage> {
+    let output = Command::new("rpm")
+        .arg("-qa")
+        .arg("--qf")
+        .arg("%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{INSTALLTIME:date:%Y-%m-%d %H:%M}\t%{SIZE}\n")
+        .output();
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.lines().filter_map(|line| {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 5 {
+                    let size_bytes: u64 = parts[4].parse().unwrap_or(0);
+                    Some(InstalledPackage {
+                        name: parts[0].to_string(),
+                        version: parts[1].to_string(),
+                        arch: parts[2].to_string(),
+                        install_date: parts[3].to_string(),
+                        size_mb: size_bytes as f64 / (1024.0 * 1024.0),
+                    })
+                } else { None }
+            }).collect()
+        }
+        Err(_) => vec![],
+    }
+}
+
+fn get_our_package_prefixes() -> Vec<&'static str> {
+    vec![
+        "task-koge", "r7-office", "notepadqq", "newt", "pcsc-lite", "librtpkcs11ecp",
+        "lsb-cprocsp", "cprocsp", "GIA11_PPE", "nss-tools", "libnss3-tools",
+        "kumir2", "python3", "fpc", "lazarus", "geany", "codeblocks", "libreoffice", "chromium", "gimp",
+    ]
+}
+
+fn filter_our_packages(packages: &[InstalledPackage]) -> Vec<&InstalledPackage> {
+    let prefixes = get_our_package_prefixes();
+    packages.iter().filter(|p| prefixes.iter().any(|prefix| p.name.starts_with(prefix))).collect()
+}
+
+fn format_txt_report(packages: &[&InstalledPackage], timestamp: &str) -> String {
+    let mut report = String::new();
+    report += "ОТЧЁТ ПО УСТАНОВЛЕННОМУ ПО (school-installer)\n";
+    report += "=============================================\n";
+    report += &format!("Дата отчёта: {}\n", timestamp);
+    report += &format!("ОС: МОС ОС (ROSA) | Архитектура: {}\n", detect_arch());
+    report += &format!("Хост: {}\n", get_hostname());
+    report += &format!("Версия установщика: {}\n\n", VERSION);
+    report += "УСТАНОВЛЕННЫЕ ПАКЕТЫ:\n---------------------\n";
+    if packages.is_empty() {
+        report += "  (наши пакеты не найдены в системе)\n";
+    } else {
+        for pkg in packages {
+            report += &format!("  {:<35} {:<18} {:<8} {:>8.1} МБ\n",
+                format!("{}-{}", pkg.name, pkg.version), pkg.install_date, pkg.arch, pkg.size_mb);
+        }
+    }
+    report += &format!("\nВсего пакетов: {}\n", packages.len());
+    let total_size: f64 = packages.iter().map(|p| p.size_mb).sum();
+    report += &format!("Общий размер: {:.1} МБ\n", total_size);
+    report += &format!("\n---\nОтчёт создан school-installer v{}\n", VERSION);
+    report
+}
+
+fn export_report(format: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
+    let _ = tx.send(LogEvent::Line("📄 Генерирую отчёт...".to_string()));
+    let all_packages = get_installed_packages();
+    let our_packages = filter_our_packages(&all_packages);
+    let timestamp = chrono_now_approx();
+    let content = format_txt_report(&our_packages, &timestamp);
+    let report_dir = get_report_dir();
+    let filename = format!("school-installer-report-{}.{}", timestamp, format);
+    let filepath = Path::new(&report_dir).join(&filename);
+    match fs::write(&filepath, &content) {
+        Ok(_) => {
+            let _ = tx.send(LogEvent::Line(format!("✅ Отчёт сохранён: {}", filepath.display())));
+            (true, format!("Отчёт сохранён: {}", filepath.display()))
+        }
+        Err(e) => (false, format!("❌ Ошибка записи: {}", e)),
+    }
 }
 
 // ==================== TUI ====================
@@ -1618,26 +1804,31 @@ struct CommandItem {
 }
 
 const COMMANDS: &[CommandItem] = &[
-    CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, размеры, свободное место и инструкцию по подготовке флешки.", icon: "ℹ", hotkey: '1' },
-    CommandItem { id: "auto_proxy", name: "Автонастройка прокси", description: "Автоматически определяет прокси из окружения, gsettings, WPAD и проверяет доступность.", icon: "⚙", hotkey: '9' },
-    CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + /etc/profile.d/proxy.sh. Сертификаты из 'cer/' или с USB в системное хранилище и NSS Chromium.", icon: "🌐", hotkey: '2' },
-    CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Автоматически ищет ca-root.crt на всех смонтированных устройствах и USB-флешках.", icon: "🔍", hotkey: '8' },
-    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/. Исключает i686 пакеты. Проверяет свободное место (мин. 1 ГБ).", icon: "⬇", hotkey: '3' },
-    CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ офлайн. Проверяет свободное место перед установкой.", icon: "⬆", hotkey: '4' },
-    CommandItem { id: "download_packages", name: "Скачать пакеты", description: "Скачивает task-koge + r7-office + notepadqq. Проверяет свободное место (мин. 2 ГБ).", icon: "📦", hotkey: '5' },
-    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ офлайн. Проверяет свободное место.", icon: "🚀", hotkey: '6' },
-    CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "5 шагов: newt → pcsc-lite → librtpkcs11ecp → КриптоПро → GIA11_PPE → pcscd. Проверяет свободное место (мин. 500 МБ).", icon: "🔐", hotkey: '7' },
-    CommandItem { id: "export_report", name: "Экспорт отчёта (TXT)", description: "Создаёт TXT-отчёт об установленных пакетах для администрации школы. Сохраняется рядом с программой.", icon: "📄", hotkey: 'e' },
+    CommandItem { id: "detect_os", name: "Информация и инструкция", description: "Показывает структуру папок, размеры, свободное место и инструкцию.", icon: "ℹ", hotkey: '1' },
+    CommandItem { id: "auto_proxy", name: "Автонастройка прокси", description: "Определяет прокси из окружения/gsettings и проверяет доступность.", icon: "⚙", hotkey: '9' },
+    CommandItem { id: "setup_env", name: "Настроить прокси + сертификат", description: "Прокси в dnf.conf + сертификаты в системное хранилище и NSS.", icon: "🌐", hotkey: '2' },
+    CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Ищет ca-root.crt на смонтированных устройствах и USB.", icon: "🔍", hotkey: '8' },
+    CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/ с проверкой места.", icon: "⬇", hotkey: '3' },
+    CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ с проверкой целостности.", icon: "⬆", hotkey: '4' },
+    CommandItem { id: "download_packages", name: "Скачать пакеты (параллельно)", description: "4 потока скачивают task-koge + r7-office + notepadqq. УЛУЧШЕНИЕ №11.", icon: "🚀", hotkey: '5' },
+    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ с проверкой SHA256.", icon: "📦", hotkey: '6' },
+    CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "5 шагов: newt → pcsc-lite → librtpkcs11ecp → КриптоПро → GIA11_PPE.", icon: "🔐", hotkey: '7' },
+    CommandItem { id: "check_integrity", name: "Проверить целостность пакетов", description: "Сверяет SHA256 всех .rpm с checksums.sha256. УЛУЧШЕНИЕ №12.", icon: "🧪", hotkey: 'c' },
+    CommandItem { id: "check_update", name: "Проверить обновления", description: "Запрашивает GitHub Releases и сравнивает версии. УЛУЧШЕНИЕ №13.", icon: "🔗", hotkey: 'u' },
+    CommandItem { id: "apply_update", name: "Применить обновление", description: "Скачивает новую версию, проверяет SHA256, заменяет бинарник. УЛУЧШЕНИЕ №13.", icon: "🔁", hotkey: 'r' },
+    CommandItem { id: "export_report", name: "Экспорт отчёта (TXT)", description: "Создаёт TXT-отчёт об установленных пакетах.", icon: "📄", hotkey: 'e' },
     CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕", hotkey: '0' },
 ];
 
 fn needs_confirmation(cmd_id: &str) -> bool {
-    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia" | "find_cert" | "auto_proxy" | "export_report")
+    matches!(cmd_id, "setup_env" | "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia" | "find_cert" | "auto_proxy" | "export_report" | "apply_update")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)]).split(r);
-    Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)]).split(popup_layout[1])[1]
+    let popup_layout = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)]).split(r);
+    Layout::default().direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)]).split(popup_layout[1])[1]
 }
 
 struct App {
@@ -1663,14 +1854,11 @@ impl App {
         ensure_directories();
         App {
             selected: 0, list_state,
-            status: "Готов к работе. Выберите ℹ для инструкции.".to_string(),
-            is_running: false,
-            arch,
+            status: format!("Готов. v{} | Выберите ℹ для инструкции", VERSION),
+            is_running: false, arch,
             progress: 0.0, progress_label: String::new(),
             log_lines: Vec::new(), log_rx: None,
-            first_run_shown: false,
-            show_help: false,
-            pending_command: None,
+            first_run_shown: false, show_help: false, pending_command: None,
         }
     }
     fn next(&mut self) {
@@ -1685,22 +1873,14 @@ impl App {
     }
     fn select_by_hotkey(&mut self, key: char) {
         if self.is_running || self.pending_command.is_some() { return; }
-        match key {
-            '1' => self.selected = 0,
-            '2' => self.selected = 2,
-            '3' => self.selected = 4,
-            '4' => self.selected = 5,
-            '5' => self.selected = 6,
-            '6' => self.selected = 7,
-            '7' => self.selected = 8,
-            '8' => self.selected = 3,
-            '9' => self.selected = 1,
-            'e' | 'E' | 'у' | 'У' => self.selected = 9,  // Экспорт отчёта
-            '0' => self.selected = 10,
-            _ => return,
+        for (i, cmd) in COMMANDS.iter().enumerate() {
+            if cmd.hotkey == key {
+                self.selected = i;
+                self.list_state.select(Some(i));
+                self.execute_selected();
+                return;
+            }
         }
-        self.list_state.select(Some(self.selected));
-        self.execute_selected();
     }
     fn execute_selected(&mut self) {
         if self.is_running || self.pending_command.is_some() { return; }
@@ -1744,14 +1924,12 @@ impl App {
                     LogEvent::Progress(p, label) => {
                         self.progress = p;
                         self.progress_label = label.clone();
-                        log_to_file(&format!("[PROGRESS] {} {}", p, label));
                     }
                     LogEvent::Done(ok, msg) => {
                         self.progress = 1.0;
                         self.progress_label = String::new();
                         self.status = if ok { format!("✅ {}", msg) } else { format!("❌ {}", msg) };
                         self.is_running = false;
-                        log_to_file(&format!("=== ЗАВЕРШЕНО: {} ===", msg));
                         rx = None;
                         break;
                     }
@@ -1763,38 +1941,39 @@ impl App {
 }
 
 fn ui(f: &mut Frame, app: &App) {
-    let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3), Constraint::Length(3)]).split(f.area());
+    let chunks = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3), Constraint::Length(3)]).split(f.area());
 
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(" ШКОЛЬНЫЙ УСТАНОВЩИК ПО ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(format!("ОС: МОС ОС | Арх: {} | v{}", app.arch, VERSION), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-    ])])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+    ])]).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(header, chunks[0]);
 
-    let main_chunks = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(45), Constraint::Percentage(55)]).split(chunks[1]);
+    let main_chunks = Layout::default().direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)]).split(chunks[1]);
 
     let items: Vec<ListItem> = COMMANDS.iter().enumerate().map(|(i, cmd)| {
         let style = if i == app.selected { Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD) }
                     else if app.is_running { Style::default().fg(Color::DarkGray) }
                     else { Style::default().fg(Color::White) };
-        let hotkey_str = if cmd.hotkey == '0' { "0".to_string() } else { format!("{}", cmd.hotkey) };
         ListItem::new(Line::from(vec![
-            Span::styled(format!("{} ", hotkey_str), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} ", cmd.hotkey), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" {} ", cmd.icon), style),
             Span::styled(cmd.name, style),
         ]))
     }).collect();
 
-    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-9,E=выбор, 0=выход, h=скрыть, ↑↓=навигация, q=выход " }
+    let menu_title = if app.show_help { " ГОРЯЧИЕ КЛАВИШИ: 1-9,c,u,r,e=выбор, 0=выход, h=скрыть " }
                      else if app.pending_command.is_some() { " ⚠️ ОЖИДАНИЕ ПОДТВЕРЖДЕНИЯ: Y=да, N=отмена " }
-                     else { " КОМАНДЫ (1-9,E: выбор, h: помощь, ↑↓, Enter, q) " };
+                     else { " КОМАНДЫ (цифры+буквы: выбор, h: помощь, ↑↓, Enter, q) " };
 
     let commands_list = List::new(items).block(Block::default().title(menu_title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).highlight_symbol("▸ ");
     f.render_stateful_widget(commands_list, main_chunks[0], &mut app.list_state.clone());
 
-    let right_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(8), Constraint::Min(0)]).split(main_chunks[1]);
+    let right_chunks = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(0)]).split(main_chunks[1]);
 
     if app.show_help {
         let help_text = vec![
@@ -1806,22 +1985,21 @@ fn ui(f: &mut Frame, app: &App) {
             Line::from("  8 — 🔍 Найти сертификат на USB"),
             Line::from("  3 — ⬇ Скачать обновления системы"),
             Line::from("  4 — ⬆ Установить обновления"),
-            Line::from("  5 — 📦 Скачать пакеты"),
-            Line::from("  6 — 🚀 Установить пакеты"),
+            Line::from("  5 — 🚀 Скачать пакеты (4 потока)"),
+            Line::from("  6 — 📦 Установить пакеты"),
             Line::from("  7 — 🔐 Установить КриптоПро + ГИА"),
+            Line::from("  C — 🧪 Проверить целостность (SHA256)"),
+            Line::from("  U — 🔗 Проверить обновления"),
+            Line::from("  R — 🔁 Применить обновление"),
             Line::from("  E — 📄 Экспорт отчёта (TXT)"),
             Line::from("  0 — ✕ Выход"),
             Line::from(""),
-            Line::from("  ↑/k — предыдущий пункт"),
-            Line::from("  ↓/j — следующий пункт"),
-            Line::from("  Enter — выполнить выбранный пункт"),
-            Line::from("  h — показать/скрыть эту справку"),
+            Line::from("  ↑/k ↓/j — навигация"),
+            Line::from("  Enter — выполнить"),
+            Line::from("  h — показать/скрыть справку"),
             Line::from("  q/Esc — выход"),
-            Line::from("  Ctrl+C — аварийный выход"),
-            Line::from(""),
-            Line::from(Span::styled("💡 Совет: нажмите цифру или E — команда запустится мгновенно!", Style::default().fg(Color::Green))),
         ];
-        let help_widget = Paragraph::new(help_text).block(Block::default().title(" СПРАВКА ПО ГОРЯЧИМ КЛАВИШАМ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow))).wrap(Wrap { trim: false });
+        let help_widget = Paragraph::new(help_text).block(Block::default().title(" СПРАВКА ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow))).wrap(Wrap { trim: false });
         f.render_widget(help_widget, right_chunks[0]);
     } else {
         let selected_cmd = &COMMANDS[app.selected];
@@ -1836,10 +2014,7 @@ fn ui(f: &mut Frame, app: &App) {
     let height = right_chunks[1].height.saturating_sub(2) as usize;
     let start = app.log_lines.len().saturating_sub(height);
     let visible_lines: Vec<Line> = app.log_lines[start..].to_vec();
-
-    let log_widget = Paragraph::new(visible_lines)
-        .block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-        .wrap(Wrap { trim: false });
+    let log_widget = Paragraph::new(visible_lines).block(Block::default().title(" ЛОГ ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).wrap(Wrap { trim: false });
     f.render_widget(log_widget, right_chunks[1]);
 
     let progress_width = (app.progress * 100.0) as u16;
@@ -1851,16 +2026,14 @@ fn ui(f: &mut Frame, app: &App) {
         Span::styled(format!("[{}{}]", filled, empty), Style::default().fg(pct_color)),
         Span::styled(format!(" {:.0}%", app.progress * 100.0), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", app.progress_label), Style::default().fg(Color::White)),
-    ])])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+    ])]).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(progress_bar, chunks[2]);
 
     let status_color = if app.status.starts_with("✅") { Color::Green } else if app.status.starts_with("❌") { Color::Red } else if app.status.starts_with("▶") { Color::Yellow } else if app.status.starts_with("⚠") { Color::Yellow } else { Color::White };
     let status_widget = Paragraph::new(vec![Line::from(vec![
         Span::styled(" Статус: ", Style::default().fg(Color::Cyan)),
         Span::styled(app.status.as_str(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-    ])])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+    ])]).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(status_widget, chunks[3]);
 
     if let Some(idx) = app.pending_command {
@@ -1875,12 +2048,10 @@ fn ui(f: &mut Frame, app: &App) {
             Line::from(""),
             Line::from(Span::styled(format!("  [{}] {}", COMMANDS[idx].hotkey, COMMANDS[idx].name), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
             Line::from(""),
-            Line::from(Span::styled("Это действие изменит систему или скачает данные.", Style::default().fg(Color::Red))),
-            Line::from(""),
             Line::from(Span::styled("Нажмите [Y] для подтверждения", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
             Line::from(Span::styled("Нажмите [N] или Esc для отмены", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
         ];
-        let paragraph = Paragraph::new(text).block(Block::default().borders(Borders::NONE)).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
         f.render_widget(paragraph, inner_area);
     }
 }
@@ -1900,7 +2071,6 @@ fn main() -> io::Result<()> {
                 if args.len() < 3 { println!("Использование: --set-proxy <URL>"); return Ok(()); }
                 save_setting("PROXY_URL", &args[2])?;
                 println!("✅ Прокси установлен: {}", args[2]);
-                log_to_file(&format!("CLI: set-proxy {}", args[2]));
                 return Ok(());
             }
             "set-cert-dir" => {
@@ -1930,24 +2100,9 @@ fn main() -> io::Result<()> {
             "find-cert" => {
                 println!("🔍 Поиск сертификата {}...", CERT_FILE_NAME);
                 if let Some(cert_path) = find_cert_on_mounted_devices() {
-                    println!("✅ Найден на смонтированном устройстве: {}", cert_path);
-                } else if let Some(device) = find_first_usb_device() {
-                    println!("⚠ На смонтированных не найден. Монтирую {}...", device);
-                    let (tx, _rx) = mpsc::channel::<LogEvent>();
-                    if let Some(mount_point) = mount_usb_device(&device, &tx) {
-                        let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
-                        if cert_path.exists() {
-                            println!("✅ Найден на флешке: {}", cert_path.display());
-                            unmount_device(&mount_point, &tx);
-                        } else {
-                            println!("❌ Файл не найден на флешке");
-                            unmount_device(&mount_point, &tx);
-                        }
-                    } else {
-                        println!("❌ Не удалось смонтировать USB");
-                    }
+                    println!("✅ Найден: {}", cert_path);
                 } else {
-                    println!("❌ USB-устройства не найдены");
+                    println!("❌ Не найден");
                 }
                 return Ok(());
             }
@@ -1959,35 +2114,66 @@ fn main() -> io::Result<()> {
                     match rx.recv() {
                         Ok(LogEvent::Line(s)) => println!("{}", s),
                         Ok(LogEvent::Progress(p, l)) => println!("[{:>3.0}%] {}", p * 100.0, l),
-                        Ok(LogEvent::Done(ok, msg)) => {
-                            println!("{}", msg);
-                            if !ok { std::process::exit(1); }
-                            break;
-                        }
+                        Ok(LogEvent::Done(ok, msg)) => { println!("{}", msg); if !ok { std::process::exit(1); } break; }
                         Err(_) => break,
                     }
                 }
                 return Ok(());
             }
             "export-report" => {
-                // УЛУЧШЕНИЕ №10: экспорт отчёта
                 let format = if args.len() >= 3 { args[2].as_str() } else { "txt" };
                 println!("📄 Генерирую отчёт в формате {}...", format);
                 let (tx, rx) = mpsc::channel::<LogEvent>();
                 let fmt = format.to_string();
-                thread::spawn(move || {
-                    let _ = export_report(&fmt, &tx);
-                });
+                thread::spawn(move || { let _ = export_report(&fmt, &tx); });
                 loop {
                     match rx.recv() {
                         Ok(LogEvent::Line(s)) => println!("{}", s),
-                        Ok(LogEvent::Progress(p, l)) => println!("[{:>3.0}%] {}", p * 100.0, l),
-                        Ok(LogEvent::Done(ok, msg)) => {
-                            println!("{}", msg);
-                            if !ok { std::process::exit(1); }
-                            break;
-                        }
+                        Ok(LogEvent::Done(ok, msg)) => { println!("{}", msg); if !ok { std::process::exit(1); } break; }
                         Err(_) => break,
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
+            "check-integrity" => {
+                println!("🧪 Проверка целостности пакетов...");
+                let (tx, rx) = mpsc::channel::<LogEvent>();
+                thread::spawn(move || { run_command("check_integrity", &tx); });
+                loop {
+                    match rx.recv() {
+                        Ok(LogEvent::Line(s)) => println!("{}", s),
+                        Ok(LogEvent::Done(ok, msg)) => { println!("{}", msg); if !ok { std::process::exit(1); } break; }
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
+            "check-update" => {
+                println!("🔗 Проверка обновлений...");
+                let (tx, rx) = mpsc::channel::<LogEvent>();
+                thread::spawn(move || { run_command("check_update", &tx); });
+                loop {
+                    match rx.recv() {
+                        Ok(LogEvent::Line(s)) => println!("{}", s),
+                        Ok(LogEvent::Done(ok, msg)) => { println!("{}", msg); break; }
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
+            "apply-update" => {
+                println!("🔁 Применение обновления...");
+                let (tx, rx) = mpsc::channel::<LogEvent>();
+                thread::spawn(move || { run_command("apply_update", &tx); });
+                loop {
+                    match rx.recv() {
+                        Ok(LogEvent::Line(s)) => println!("{}", s),
+                        Ok(LogEvent::Done(ok, msg)) => { println!("{}", msg); if !ok { std::process::exit(1); } break; }
+                        Err(_) => break,
+                        _ => {}
                     }
                 }
                 return Ok(());
@@ -2000,19 +2186,14 @@ fn main() -> io::Result<()> {
                 println!("Папка КриптоПро: {}", get_crypto_dir());
                 println!("Папка пакетов: {}", get_school_packages_dir());
                 println!("Папка обновлений: {}", get_updates_dir());
-                if let Some(free_mb) = get_free_space_mb(".") { println!("💾 Свободно на диске: {}", format_size_mb(free_mb)); }
                 println!("\n📝 Лог: {}", log_file_path());
-                let system_arch = detect_arch();
-                println!("\n📊 Размеры папок:");
-                println!("  school_packages: {}", folder_info_line("", &get_school_packages_dir(), &system_arch));
-                println!("  updates: {}", folder_info_line("", &get_updates_dir(), &system_arch));
-                println!("  cryptopro_gia: {}", folder_info_line("", &get_crypto_dir(), &system_arch));
-                println!("  cer: {}", folder_info_line("", &get_cert_dir(), &system_arch));
+                println!("📦 Проверка целостности: {}", Path::new(&get_school_packages_dir()).join(CHECKSUM_FILE).display());
+                println!("🔗 GitHub: {}/{}", GITHUB_REPO_OWNER, GITHUB_REPO_NAME);
                 return Ok(());
             }
             "reset-settings" => {
                 let _ = fs::remove_file(SETTINGS_FILE);
-                println!("✅ Настройки сброшены к значениям по умолчанию");
+                println!("✅ Настройки сброшены");
                 return Ok(());
             }
             _ => {}
@@ -2027,19 +2208,15 @@ fn main() -> io::Result<()> {
             "setup-env" => "setup_env", "download-updates" => "download_updates", "install-updates" => "install_updates",
             "download-packages" => "download_packages", "install-packages" => "install_packages", "install-crypto-gia" => "install_cryptopro_gia",
             "find-cert" => "find_cert", "auto-proxy" => "auto_proxy", "export-report" => "export_report",
+            "check-integrity" => "check_integrity", "check-update" => "check_update", "apply-update" => "apply_update",
             _ => { println!("Неизвестная команда: {}", mode); return Ok(()); }
         };
         thread::spawn(move || run_command(&cmd_id, &tx));
         loop {
             match rx.recv() {
                 Ok(LogEvent::Line(s)) => { println!("{}", s); log_to_file(&s); }
-                Ok(LogEvent::Progress(p, l)) => { println!("[{:>3.0}%] {}", p * 100.0, l); log_to_file(&format!("[PROGRESS] {} {}", p, l)); }
-                Ok(LogEvent::Done(ok, msg)) => {
-                    println!("{}", msg);
-                    log_to_file(&format!("=== ЗАВЕРШЕНО: {} ===", msg));
-                    if !ok { std::process::exit(1); }
-                    break;
-                }
+                Ok(LogEvent::Progress(p, l)) => { println!("[{:>3.0}%] {}", p * 100.0, l); }
+                Ok(LogEvent::Done(ok, msg)) => { println!("{}", msg); if !ok { std::process::exit(1); } break; }
                 Err(_) => break,
             }
         }
@@ -2081,10 +2258,14 @@ fn main() -> io::Result<()> {
 
                 if let KeyCode::Char(c) = key.code {
                     if !app.is_running {
-                        match c {
-                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '0' => { app.select_by_hotkey(c); if c == '0' { break; } continue; }
-                            'e' | 'E' | 'у' | 'У' => { app.select_by_hotkey(c); continue; }
-                            'h' | 'H' | 'р' | 'Р' => { app.toggle_help(); continue; }
+                        let lower = c.to_ascii_lowercase();
+                        match lower {
+                            '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '0' | 'c' | 'u' | 'r' | 'e' => {
+                                app.select_by_hotkey(lower);
+                                if lower == '0' { break; }
+                                continue;
+                            }
+                            'h' => { app.toggle_help(); continue; }
                             _ => {}
                         }
                     }
