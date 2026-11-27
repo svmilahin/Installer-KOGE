@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,12 +35,10 @@ const PROXY_TEST_URL: &str = "http://ya.ru";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 5;
 const VERSION: &str = "1.0.0";
 
-// УЛУЧШЕНИЕ №11: количество параллельных потоков (для будущих задач)
 const MAX_PARALLEL_DOWNLOADS: usize = 4;
 
-// УЛУЧШЕНИЕ №13: репозиторий для автообновления
-const GITHUB_REPO_OWNER: &str = "your-org"; // ← ЗАМЕНИТЬ НА СВОЙ
-const GITHUB_REPO_NAME: &str = "school-installer"; // ← ЗАМЕНИТЬ НА СВОЙ
+const GITHUB_REPO_OWNER: &str = "your-org";
+const GITHUB_REPO_NAME: &str = "school-installer";
 const GITHUB_API_URL: &str = "https://api.github.com";
 
 const DEFAULT_PROXY_URL: &str = "http://10.0.54.52:3128";
@@ -482,7 +481,7 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
 
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
     let _ = tx.send(LogEvent::Line("  📋 ИНСТРУКЦИЯ ПО ПОДГОТОВКЕ ФЛЕШКИ".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("  school-installer v{}", VERSION)).to_string());
+    let _ = tx.send(LogEvent::Line(format!("  school-installer v{}", VERSION)));
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
     let _ = tx.send(LogEvent::Line(format!("🖥 ОС: МОС ОС (ROSA) | Архитектура: {}", system_arch)));
@@ -534,13 +533,13 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line("  2. Положите ca-root.crt в папку cer/".to_string()));
     let _ = tx.send(LogEvent::Line("  3. sudo ./school-installer".to_string()));
     let _ = tx.send(LogEvent::Line("     -> ⚙ Автонастройка прокси".to_string()));
-    let _ = tx.send(LogEvent::Line("     -> 🚀 Скачать пакеты (с зависимостями)".to_string()));
+    let _ = tx.send(LogEvent::Line("     -> 📦 Скачать пакеты (с зависимостями)".to_string()));
     let _ = tx.send(LogEvent::Line("  4. Скопируйте на флешку:".to_string()));
     let _ = tx.send(LogEvent::Line("     school-installer + school_packages/ + cryptopro_gia/ + cer/".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
     let _ = tx.send(LogEvent::Line("В КЛАССЕ (без интернета):".to_string()));
     let _ = tx.send(LogEvent::Line("  1. sudo ./school-installer".to_string()));
-    let _ = tx.send(LogEvent::Line("     -> 📦 Установить пакеты (с проверкой SHA256)".to_string()));
+    let _ = tx.send(LogEvent::Line("     -> 🚀 Установить пакеты (с проверкой SHA256)".to_string()));
     let _ = tx.send(LogEvent::Line("     -> 🔐 Установить КриптоПро + ГИА".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
     let _ = tx.send(LogEvent::Line("В каждой папке есть README.txt с подробностями.".to_string()));
@@ -1005,7 +1004,7 @@ fn verify_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String,
     let checksum_path = Path::new(folder).join(CHECKSUM_FILE);
     if !checksum_path.exists() {
         let _ = tx.send(LogEvent::Line("⚠ Файл checksums.sha256 не найден — пропускаем проверку".to_string()));
-        return (true, "Проверка пропущена (нет checksums)", vec![]);
+        return (true, "Проверка пропущена (нет checksums)".to_string(), vec![]);
     }
 
     let content = match fs::read_to_string(&checksum_path) {
@@ -1075,14 +1074,14 @@ fn download_single_package(pkg: String, download_dir: String, proxy_url: String)
 
     match cmd.output() {
         Ok(out) if out.status.success() => {
-            (pkg, true, format!("{} скачан", pkg))
+            (pkg.clone(), true, format!("{} скачан", pkg))
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let msg = stderr.lines().last().unwrap_or("неизвестная ошибка").to_string();
-            (pkg, false, format!("{}: {}", pkg, msg))
+            (pkg.clone(), false, format!("{}: {}", pkg, msg))
         }
-        Err(e) => (pkg, false, format!("{}: spawn error: {}", pkg, e)),
+        Err(e) => (pkg.clone(), false, format!("{}: spawn error: {}", pkg, e)),
     }
 }
 
@@ -1127,7 +1126,7 @@ fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::
                 };
 
                 let (name, ok, msg) = download_single_package(pkg.clone(), dir.clone(), proxy.clone());
-                let _ = result_tx.send((name, ok, msg));
+                let _ = result_tx.send((name, ok, msg.clone()));
 
                 let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
                 if !ok { failed.fetch_add(1, Ordering::SeqCst); }
@@ -1150,7 +1149,7 @@ fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::
     let mut success_count = 0;
     let mut fail_count = 0;
 
-    for (name, ok, msg) in result_rx.iter() {
+    for (name, ok, _msg) in result_rx.iter() {
         if ok { success_count += 1; }
         else { fail_count += 1; }
         log_to_file(&format!("[PARALLEL] {} {}", name, if ok { "OK" } else { "FAIL" }));
@@ -1194,7 +1193,6 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
     }
 }
 
-// ✅ ИСПРАВЛЕНИЕ: скачиваем с зависимостями для офлайн-установки
 fn download_packages(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
     let (space_ok, space_msg) = check_free_space(download_dir, MIN_FREE_SPACE_PACKAGES_MB, "Скачивание пакетов");
@@ -1426,7 +1424,7 @@ fn is_newer_version(current: &str, new: &str) -> bool {
 
 fn check_for_update(tx: &mpsc::Sender<LogEvent>) -> (bool, String, Option<String>, Option<String>) {
     let url = format!("{}/repos/{}/{}/releases/latest", GITHUB_API_URL, GITHUB_REPO_OWNER, GITHUB_REPO_NAME);
-    let _ = tx.send(LogEvent::Line(format!("🔗 Проверяю обновления на GitHub...")));
+    let _ = tx.send(LogEvent::Line("🔗 Проверяю обновления на GitHub...".to_string()));
     log_to_file(&format!("Проверка обновлений: {}", url));
 
     let proxy_url = get_proxy_url();
@@ -1462,7 +1460,7 @@ fn check_for_update(tx: &mpsc::Sender<LogEvent>) -> (bool, String, Option<String
                     if is_newer_version(VERSION, &new_version) {
                         (false, format!("⚠ Найдена v{}, но нет download_url в релизе", new_version), Some(new_version), None)
                     } else {
-                        (false, format!("✅ Обновлений нет"), None, None)
+                        (false, "✅ Обновлений нет".to_string(), None, None)
                     }
                 }
                 _ => (false, "❌ Не удалось разобрать ответ GitHub API".to_string(), None, None),
@@ -1767,7 +1765,7 @@ fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
             if has_update {
                 match (new_version, url) {
                     (Some(_v), Some(_u)) => {
-                        let _ = tx.send(LogEvent::Line(format!("   💡 Для применения: команда '🔁 Применить обновление'".to_string())));
+                        let _ = tx.send(LogEvent::Line("   💡 Для применения: команда '🔁 Применить обновление'".to_string()));
                         (true, msg)
                     }
                     _ => (false, msg)
@@ -2174,7 +2172,7 @@ fn main() -> io::Result<()> {
                 loop {
                     match rx.recv() {
                         Ok(LogEvent::Line(s)) => println!("{}", s),
-                        Ok(LogEvent::Done(ok, msg)) => { println!("{}", msg); break; }
+                        Ok(LogEvent::Done(_ok, msg)) => { println!("{}", msg); break; }
                         Err(_) => break,
                         _ => {}
                     }
@@ -2203,6 +2201,7 @@ fn main() -> io::Result<()> {
                 println!("Папка КриптоПро: {}", get_crypto_dir());
                 println!("Папка пакетов: {}", get_school_packages_dir());
                 println!("Папка обновлений: {}", get_updates_dir());
+                if let Some(free_mb) = get_free_space_mb(".") { println!("💾 Свободно на диске: {}", format_size_mb(free_mb)); }
                 println!("\n📝 Лог: {}", log_file_path());
                 println!("📦 Проверка целостности: {}", Path::new(&get_school_packages_dir()).join(CHECKSUM_FILE).display());
                 println!("🔗 GitHub: {}/{}", GITHUB_REPO_OWNER, GITHUB_REPO_NAME);
