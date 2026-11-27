@@ -1014,7 +1014,6 @@ fn verify_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String,
 
     let mut broken: Vec<String> = Vec::new();
     let mut checked = 0;
-    let mut ok_count = 0;
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1031,7 +1030,7 @@ fn verify_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String,
         checked += 1;
         if let Some(actual_hash) = calculate_sha256(&full_path.to_string_lossy()) {
             if actual_hash == expected_hash {
-                ok_count += 1;
+                // всё ок
             } else {
                 broken.push(format!("{} (хеши не совпадают)", filename));
                 let _ = tx.send(LogEvent::Line(format!("   ❌ НЕ СОВПАДАЕТ: {}", filename)));
@@ -1504,7 +1503,9 @@ fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEven
         Ok(e) => e,
         Err(e) => return (false, format!("❌ Не удалось получить путь к бинарнику: {}", e)),
     };
-    let update_dir = Path::new(&get_report_dir());
+    // ✅ ИСПРАВЛЕНИЕ E0716: сохраняем String в переменную, чтобы он жил достаточно долго
+    let report_dir = get_report_dir();
+    let update_dir = Path::new(&report_dir);
     let download_path = update_dir.join(format!("school-installer-{}.tmp", new_version));
 
     let proxy_url = get_proxy_url();
