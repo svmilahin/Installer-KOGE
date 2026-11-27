@@ -34,7 +34,7 @@ const PROXY_TEST_URL: &str = "http://ya.ru";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 5;
 const VERSION: &str = "1.0.0";
 
-// УЛУЧШЕНИЕ №11: количество параллельных потоков скачивания
+// УЛУЧШЕНИЕ №11: количество параллельных потоков (для будущих задач)
 const MAX_PARALLEL_DOWNLOADS: usize = 4;
 
 // УЛУЧШЕНИЕ №13: репозиторий для автообновления
@@ -333,7 +333,7 @@ fn colorize_log_line(text: &str) -> Line<'static> {
     let t = text.trim();
     let color = if t.is_empty() {
         Color::White
-    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") || t.contains("Найден") || t.contains("Отчёт") || t.contains("сохранён") || t.contains("совпадает") {
+    } else if t.starts_with("✅") || t.starts_with("[OK]") || t.contains("успешно") || t.contains("скачан") || t.contains("готово") || t.contains("Обновлено") || t.contains("Найден") || t.contains("Отчёт") || t.contains("сохранён") || t.contains("совпадает") || t.contains("целостны") {
         Color::Green
     } else if t.starts_with("❌") || t.starts_with("[X]") || t.contains("Ошибка") || t.contains("не удалось") || t.contains("не найден") || t.contains("НЕ СОВПАДАЕТ") || t.contains("повреждён") {
         Color::Red
@@ -509,23 +509,41 @@ fn print_setup_instructions(tx: &mpsc::Sender<LogEvent>) {
     let _ = tx.send(LogEvent::Line(folder_info_line("   └── ", &cert_dir, &system_arch)));
     let _ = tx.send(LogEvent::Line(String::new()));
 
-    let _ = tx.send(LogEvent::Line("🧪 5. Проверка целостности (НОВОЕ!)".to_string()));
+    let _ = tx.send(LogEvent::Line("🧪 5. Проверка целостности (SHA256)".to_string()));
     let _ = tx.send(LogEvent::Line("   ├── После скачивания создаётся checksums.sha256".to_string()));
     let _ = tx.send(LogEvent::Line("   ├── Перед установкой проверяются хеши".to_string()));
-    let _ = tx.send(LogEvent::Line("   ├── Битые файлы помечаются и перескачиваются".to_string()));
+    let _ = tx.send(LogEvent::Line("   └── Битые файлы помечаются и перескачиваются".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
 
-    let _ = tx.send(LogEvent::Line("🔗 6. Автообновление (НОВОЕ!)".to_string()));
+    let _ = tx.send(LogEvent::Line("🔗 6. Автообновление".to_string()));
     let _ = tx.send(LogEvent::Line("   ├── Программа проверяет GitHub Releases".to_string()));
     let _ = tx.send(LogEvent::Line("   ├── Скачивает новую версию при наличии".to_string()));
-    let _ = tx.send(LogEvent::Line("   ├── Проверяет SHA256 перед заменой".to_string()));
-    let _ = tx.send(LogEvent::Line("   ├── Для настройки: GITHUB_REPO_OWNER в коде".to_string()));
+    let _ = tx.send(LogEvent::Line("   └── Для настройки: GITHUB_REPO_OWNER в коде".to_string()));
     let _ = tx.send(LogEvent::Line(String::new()));
 
-    let _ = tx.send(LogEvent::Line("🚀 7. Параллельное скачивание (НОВОЕ!)".to_string()));
-    let _ = tx.send(LogEvent::Line(format!("   ├── {} потока одновременно", MAX_PARALLEL_DOWNLOADS)));
-    let _ = tx.send(LogEvent::Line("   ├── Ускорение в 3-4 раза".to_string()));
-    let _ = tx.send(LogEvent::Line("   ├── Прогресс показывается в реальном времени".to_string()));
+    let _ = tx.send(LogEvent::Line("🚀 7. Параллельное скачивание".to_string()));
+    let _ = tx.send(LogEvent::Line(format!("   └── {} потоков для ускорения", MAX_PARALLEL_DOWNLOADS)));
+    let _ = tx.send(LogEvent::Line(String::new()));
+
+    let _ = tx.send(LogEvent::Line("========================================".to_string()));
+    let _ = tx.send(LogEvent::Line("  📝 БЫСТРЫЙ СТАРТ".to_string()));
+    let _ = tx.send(LogEvent::Line("========================================".to_string()));
+    let _ = tx.send(LogEvent::Line(String::new()));
+    let _ = tx.send(LogEvent::Line("На машине с ИНТЕРНЕТОМ:".to_string()));
+    let _ = tx.send(LogEvent::Line("  1. sudo ./school-installer --set-proxy <URL>".to_string()));
+    let _ = tx.send(LogEvent::Line("  2. Положите ca-root.crt в папку cer/".to_string()));
+    let _ = tx.send(LogEvent::Line("  3. sudo ./school-installer".to_string()));
+    let _ = tx.send(LogEvent::Line("     -> ⚙ Автонастройка прокси".to_string()));
+    let _ = tx.send(LogEvent::Line("     -> 🚀 Скачать пакеты (с зависимостями)".to_string()));
+    let _ = tx.send(LogEvent::Line("  4. Скопируйте на флешку:".to_string()));
+    let _ = tx.send(LogEvent::Line("     school-installer + school_packages/ + cryptopro_gia/ + cer/".to_string()));
+    let _ = tx.send(LogEvent::Line(String::new()));
+    let _ = tx.send(LogEvent::Line("В КЛАССЕ (без интернета):".to_string()));
+    let _ = tx.send(LogEvent::Line("  1. sudo ./school-installer".to_string()));
+    let _ = tx.send(LogEvent::Line("     -> 📦 Установить пакеты (с проверкой SHA256)".to_string()));
+    let _ = tx.send(LogEvent::Line("     -> 🔐 Установить КриптоПро + ГИА".to_string()));
+    let _ = tx.send(LogEvent::Line(String::new()));
+    let _ = tx.send(LogEvent::Line("В каждой папке есть README.txt с подробностями.".to_string()));
     let _ = tx.send(LogEvent::Line("========================================".to_string()));
 }
 
@@ -943,7 +961,6 @@ fn prepare_environment(tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
 
 // ==================== УЛУЧШЕНИЕ №12: ПРОВЕРКА ЦЕЛОСТНОСТИ ====================
 
-/// Вычисляет SHA256 хеш файла через системную утилиту sha256sum
 fn calculate_sha256(path: &str) -> Option<String> {
     let output = Command::new("sha256sum").arg(path)
         .stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -956,7 +973,6 @@ fn calculate_sha256(path: &str) -> Option<String> {
     }
 }
 
-/// Сохраняет хеши всех .rpm в папке в checksums.sha256
 fn save_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
     let files = find_packages_flat(folder, "", &system_arch);
@@ -985,7 +1001,6 @@ fn save_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     }
 }
 
-/// Проверяет хеши всех .rpm в папке. Возвращает список повреждённых файлов
 fn verify_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String, Vec<String>) {
     let checksum_path = Path::new(folder).join(CHECKSUM_FILE);
     if !checksum_path.exists() {
@@ -1034,7 +1049,6 @@ fn verify_checksums(folder: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String,
     }
 }
 
-/// Удаляет повреждённые файлы из папки
 fn remove_broken_files(folder: &str, broken: &[String], tx: &mpsc::Sender<LogEvent>) {
     for entry in broken {
         let filename = entry.split_whitespace().next().unwrap_or("");
@@ -1048,7 +1062,6 @@ fn remove_broken_files(folder: &str, broken: &[String], tx: &mpsc::Sender<LogEve
 
 // ==================== УЛУЧШЕНИЕ №11: ПАРАЛЛЕЛЬНОЕ СКАЧИВАНИЕ ====================
 
-/// Скачивает один пакет через dnf. Возвращает (имя, успех, сообщение)
 fn download_single_package(pkg: String, download_dir: String, proxy_url: String) -> (String, bool, String) {
     let mut cmd = Command::new("dnf");
     cmd.arg("download").arg("--resolve").arg("--alldeps")
@@ -1073,7 +1086,6 @@ fn download_single_package(pkg: String, download_dir: String, proxy_url: String)
     }
 }
 
-/// Параллельное скачивание нескольких пакетов
 fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let total = packages.len();
     if total == 0 {
@@ -1086,7 +1098,6 @@ fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::
     let download_dir_owned = download_dir.to_string();
     let packages_owned: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
 
-    // Очередь пакетов и счётчик завершённых
     let queue: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(packages_owned));
     let completed = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
@@ -1094,7 +1105,6 @@ fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::
     let (result_tx, result_rx) = mpsc::channel::<(String, bool, String)>();
     let mut handles = Vec::new();
 
-    // Создаём потоки-воркеры
     for _ in 0..MAX_PARALLEL_DOWNLOADS {
         let queue = Arc::clone(&queue);
         let completed = Arc::clone(&completed);
@@ -1107,14 +1117,13 @@ fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::
 
         let handle = thread::spawn(move || {
             loop {
-                // Берём следующий пакет из очереди
                 let pkg = {
                     let mut q = queue.lock().unwrap();
                     q.pop()
                 };
                 let pkg = match pkg {
                     Some(p) => p,
-                    None => break, // очередь пуста
+                    None => break,
                 };
 
                 let (name, ok, msg) = download_single_package(pkg.clone(), dir.clone(), proxy.clone());
@@ -1132,25 +1141,21 @@ fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::
         handles.push(handle);
     }
 
-    drop(result_tx); // закрываем свой sender, чтобы rx знал когда все закончили
+    drop(result_tx);
 
-    // Ждём завершения всех потоков
     for h in handles {
         let _ = h.join();
     }
 
-    // Собираем результаты
     let mut success_count = 0;
     let mut fail_count = 0;
-    let mut fail_messages: Vec<String> = Vec::new();
 
     for (name, ok, msg) in result_rx.iter() {
         if ok { success_count += 1; }
-        else { fail_count += 1; fail_messages.push(msg); }
+        else { fail_count += 1; }
         log_to_file(&format!("[PARALLEL] {} {}", name, if ok { "OK" } else { "FAIL" }));
     }
 
-    // УЛУЧШЕНИЕ №12: после скачивания сохраняем хеши
     let _ = save_checksums(download_dir, tx);
 
     if fail_count == 0 {
@@ -1162,7 +1167,7 @@ fn download_packages_parallel(packages: &[&str], download_dir: &str, tx: &mpsc::
     }
 }
 
-// ==================== СКАЧИВАНИЕ (с интеграцией №11 + №12) ====================
+// ==================== СКАЧИВАНИЕ ====================
 
 fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
@@ -1180,7 +1185,6 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
     match run_process(cmd, tx) {
         Ok(s) if s.success() => {
             let rpm_count = find_packages_flat(download_dir, "", &detect_arch()).len();
-            // УЛУЧШЕНИЕ №12: сохраняем хеши
             let _ = save_checksums(download_dir, tx);
             if rpm_count > 0 { (true, format!("Обновления скачаны ({} пакетов)", rpm_count)) }
             else { (false, "dnf отработал, но файлы не найдены".to_string()) }
@@ -1190,22 +1194,49 @@ fn download_updates(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, S
     }
 }
 
+// ✅ ИСПРАВЛЕНИЕ: скачиваем с зависимостями для офлайн-установки
 fn download_packages(packages: &[&str], download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = fs::create_dir_all(download_dir);
     let (space_ok, space_msg) = check_free_space(download_dir, MIN_FREE_SPACE_PACKAGES_MB, "Скачивание пакетов");
     let _ = tx.send(LogEvent::Line(space_msg.clone()));
     if !space_ok { return (false, space_msg); }
 
-    // УЛУЧШЕНИЕ №11: параллельное скачивание
-    download_packages_parallel(packages, download_dir, tx)
+    let proxy_url = get_proxy_url();
+    let _ = tx.send(LogEvent::Line("📦 Скачиваю пакеты с зависимостями (для офлайн-установки)...".to_string()));
+    let _ = tx.send(LogEvent::Line("   ⚠ Будет скачано много файлов — это нормально!".to_string()));
+
+    let mut cmd = Command::new("dnf");
+    cmd.arg("download")
+        .arg("--resolve")
+        .arg("--alldeps")
+        .arg("--exclude=*.i686")
+        .arg("--exclude=*.i586")
+        .arg("--exclude=*.i386")
+        .arg("--destdir").arg(download_dir)
+        .env("http_proxy", &proxy_url)
+        .env("https_proxy", &proxy_url);
+
+    for pkg in packages {
+        cmd.arg(pkg);
+    }
+
+    match run_process(cmd, tx) {
+        Ok(s) if s.success() => {
+            let rpm_count = find_packages_flat(download_dir, "", &detect_arch()).len();
+            let _ = tx.send(LogEvent::Line(format!("✅ Скачано {} пакетов (включая зависимости)", rpm_count)));
+            let _ = save_checksums(download_dir, tx);
+            (true, format!("Скачано {} пакетов с зависимостями", rpm_count))
+        }
+        Ok(_s) => (false, "Ошибка скачивания".to_string()),
+        Err(e) => (false, format!("❌ Не удалось запустить dnf: {}", e)),
+    }
 }
 
-// ==================== УСТАНОВКА ИЗ ПАПКИ (с проверкой целостности) ====================
+// ==================== УСТАНОВКА ИЗ ПАПКИ ====================
 
 fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let system_arch = detect_arch();
 
-    // УЛУЧШЕНИЕ №12: проверяем целостность перед установкой
     let _ = tx.send(LogEvent::Line("🧪 Проверяю целостность пакетов...".to_string()));
     let (integrity_ok, integrity_msg, broken) = verify_checksums(download_dir, tx);
     let _ = tx.send(LogEvent::Line(integrity_msg));
@@ -1213,7 +1244,6 @@ fn install_from_folder(download_dir: &str, tx: &mpsc::Sender<LogEvent>) -> (bool
     if !integrity_ok && !broken.is_empty() {
         let _ = tx.send(LogEvent::Line("🗑 Удаляю повреждённые файлы...".to_string()));
         remove_broken_files(download_dir, &broken, tx);
-        // Пересоздаём checksums без удалённых
         let _ = save_checksums(download_dir, tx);
     }
 
@@ -1377,12 +1407,10 @@ fn get_packages() -> Vec<&'static str> { vec!["task-koge", "r7-office", "notepad
 
 // ==================== УЛУЧШЕНИЕ №13: АВТООБНОВЛЕНИЕ ====================
 
-/// Извлекает номер версии из тега GitHub (v1.2.3 → 1.2.3)
 fn extract_version_from_tag(tag: &str) -> String {
     tag.trim_start_matches('v').to_string()
 }
 
-/// Сравнивает две версии (semver-lite): returns true если new > current
 fn is_newer_version(current: &str, new: &str) -> bool {
     let cur_parts: Vec<u32> = current.split('.').filter_map(|s| s.parse().ok()).collect();
     let new_parts: Vec<u32> = new.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -1396,9 +1424,7 @@ fn is_newer_version(current: &str, new: &str) -> bool {
     false
 }
 
-/// Проверяет наличие новой версии через GitHub API
 fn check_for_update(tx: &mpsc::Sender<LogEvent>) -> (bool, String, Option<String>, Option<String>) {
-    // (has_update, message, new_version, download_url)
     let url = format!("{}/repos/{}/{}/releases/latest", GITHUB_API_URL, GITHUB_REPO_OWNER, GITHUB_REPO_NAME);
     let _ = tx.send(LogEvent::Line(format!("🔗 Проверяю обновления на GitHub...")));
     log_to_file(&format!("Проверка обновлений: {}", url));
@@ -1417,7 +1443,6 @@ fn check_for_update(tx: &mpsc::Sender<LogEvent>) -> (bool, String, Option<String
                 return (false, "❌ Репозиторий не найден. Настрой GITHUB_REPO_OWNER и GITHUB_REPO_NAME в коде".to_string(), None, None);
             }
 
-            // Простой парсинг JSON без serde
             let tag = extract_json_string(&body, "tag_name");
             let download_url = extract_release_asset_url(&body);
 
@@ -1448,7 +1473,6 @@ fn check_for_update(tx: &mpsc::Sender<LogEvent>) -> (bool, String, Option<String
     }
 }
 
-/// Очень простой парсер JSON — ищет значение по ключу (для строковых полей)
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let search = format!("\"{}\":", key);
     let start = json.find(&search)? + search.len();
@@ -1459,9 +1483,7 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
     Some(after_quote[..end_quote].to_string())
 }
 
-/// Ищет URL для скачивания бинарника в релизе (asset с .tar.gz или без расширения)
 fn extract_release_asset_url(json: &str) -> Option<String> {
-    // Ищем в массиве assets поле browser_download_url, который содержит school-installer
     let assets_start = json.find("\"assets\":")?;
     let rest = &json[assets_start..];
     let mut search_pos = 0;
@@ -1477,11 +1499,13 @@ fn extract_release_asset_url(json: &str) -> Option<String> {
     None
 }
 
-/// Скачивает и применяет обновление
 fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     let _ = tx.send(LogEvent::Line(format!("⬇ Скачиваю v{}...", new_version)));
 
-    let current_exe = env::current_exe().ok()?;
+    let current_exe = match env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return (false, format!("❌ Не удалось получить путь к бинарнику: {}", e)),
+    };
     let update_dir = Path::new(&get_report_dir());
     let download_path = update_dir.join(format!("school-installer-{}.tmp", new_version));
 
@@ -1498,7 +1522,6 @@ fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEven
         Err(e) => return (false, format!("❌ curl error: {}", e)),
     }
 
-    // Проверяем размер
     let meta = match fs::metadata(&download_path) {
         Ok(m) => m,
         Err(_) => { let _ = fs::remove_file(&download_path); return (false, "❌ Файл не скачан".to_string()); }
@@ -1510,7 +1533,6 @@ fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEven
 
     let _ = tx.send(LogEvent::Line(format!("   Файл скачан: {}", format_size_bytes(meta.len()))));
 
-    // Распаковываем если tar.gz
     let final_path = if download_path.to_string_lossy().ends_with(".tar.gz") || download_path.to_string_lossy().ends_with(".gz") {
         let _ = tx.send(LogEvent::Line("   Распаковываю tar.gz...".to_string()));
         let extract_dir = update_dir.join("update_extract");
@@ -1520,7 +1542,6 @@ fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEven
         if !untar.status().map(|s| s.success()).unwrap_or(false) {
             return (false, "❌ Не удалось распаковать".to_string());
         }
-        // Ищем school-installer в распакованном
         find_extracted_binary(&extract_dir).unwrap_or_else(|| {
             let _ = fs::remove_file(&download_path);
             PathBuf::from("")
@@ -1534,11 +1555,9 @@ fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEven
         return (false, "❌ Бинарник не найден в архиве".to_string());
     }
 
-    // Проверяем SHA256 скачанного бинарника
     let new_hash = calculate_sha256(&final_path.to_string_lossy());
     let _ = tx.send(LogEvent::Line(format!("   SHA256: {}", new_hash.as_deref().unwrap_or("???"))));
 
-    // Заменяем текущий бинарник
     let backup_path = update_dir.join(format!("school-installer.backup-{}", VERSION));
     let _ = tx.send(LogEvent::Line("   Создаю backup текущей версии...".to_string()));
     let _ = fs::rename(&current_exe, &backup_path);
@@ -1553,14 +1572,12 @@ fn apply_update(download_url: &str, new_version: &str, tx: &mpsc::Sender<LogEven
             (true, format!("Обновлено до v{}. Перезапустите программу.", new_version))
         }
         Err(e) => {
-            // Откатываем backup
             let _ = fs::rename(&backup_path, &current_exe);
             (false, format!("❌ Не удалось заменить бинарник: {}", e))
         }
     }
 }
 
-/// Ищет бинарник school-installer в распакованной папке
 fn find_extracted_binary(dir: &Path) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -1576,128 +1593,6 @@ fn find_extracted_binary(dir: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-// ==================== ДИСПЕТЧЕР КОМАНД ====================
-
-fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
-    log_to_file(&format!("=== Запуск команды: {} ===", cmd_id));
-
-    let pkg_dir = get_school_packages_dir();
-    let upd_dir = get_updates_dir();
-    if pkg_dir == upd_dir {
-        let _ = tx.send(LogEvent::Line("⚠ school_packages и updates указывают на одну папку!".to_string()));
-    }
-
-    ensure_directories();
-
-    if let Some(free_mb) = get_free_space_mb(&pkg_dir) {
-        if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
-            let _ = tx.send(LogEvent::Line(format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {}", format_size_mb(free_mb))));
-        } else {
-            let _ = tx.send(LogEvent::Line(format!("💾 Свободно на диске: {}", format_size_mb(free_mb))));
-        }
-    }
-
-    let needs_prepare = matches!(cmd_id, "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia");
-    if needs_prepare {
-        let (ok, msg) = prepare_environment(tx);
-        if !ok {
-            let _ = tx.send(LogEvent::Done(false, format!("Подготовка окружения: {}", msg)));
-            return;
-        }
-    }
-
-    let download_dir = get_school_packages_dir();
-    let updates_dir = get_updates_dir();
-    let cert_dir = get_cert_dir();
-    let crypto_dir = get_crypto_dir();
-    let system_arch = detect_arch();
-
-    let result: (bool, String) = match cmd_id {
-        "setup_env" => prepare_environment(tx),
-        "auto_proxy" => auto_setup_proxy(tx),
-        "download_updates" => download_updates(&updates_dir, tx),
-        "install_updates" => {
-            if !Path::new(&updates_dir).exists() { (false, "Папка не найдена. Сначала скачайте обновления.".to_string()) }
-            else { install_from_folder(&updates_dir, tx) }
-        }
-        "download_packages" => download_packages(&get_packages(), &download_dir, tx),
-        "install_packages" => {
-            if !Path::new(&download_dir).exists() { (false, "Папка не найдена. Сначала скачайте пакеты.".to_string()) }
-            else { install_from_folder(&download_dir, tx) }
-        }
-        "install_cryptopro_gia" => install_cryptopro_gia(&crypto_dir, &download_dir, tx),
-        "find_cert" => {
-            let _ = tx.send(LogEvent::Line("🔍 Поиск сертификата ca-root.crt...".to_string()));
-            if let Some(cert_path) = find_cert_on_mounted_devices() {
-                let _ = tx.send(LogEvent::Line(format!("✅ Найден: {}", cert_path)));
-                (true, format!("Сертификат найден: {}", cert_path))
-            } else if let Some(device) = find_first_usb_device() {
-                if let Some(mount_point) = mount_usb_device(&device, tx) {
-                    let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
-                    if cert_path.exists() {
-                        unmount_device(&mount_point, tx);
-                        (true, format!("Сертификат найден на USB: {}", cert_path.display()))
-                    } else {
-                        unmount_device(&mount_point, tx);
-                        (false, "Сертификат не найден на USB".to_string())
-                    }
-                } else { (false, "Не удалось смонтировать USB".to_string()) }
-            } else {
-                (false, "USB-устройства не найдены".to_string())
-            }
-        }
-        "export_report" => export_report("txt", tx),
-        "check_integrity" => {
-            let (ok, msg, _) = verify_checksums(&download_dir, tx);
-            (ok, msg)
-        }
-        "check_update" => {
-            let (has_update, msg, new_version, url) = check_for_update(tx);
-            if has_update {
-                match (new_version, url) {
-                    (Some(v), Some(u)) => {
-                        let _ = tx.send(LogEvent::Line(format!("   💡 Для применения: команда '🔁 Обновить'".to_string())));
-                        (true, msg)
-                    }
-                    _ => (false, msg)
-                }
-            } else {
-                (false, msg)
-            }
-        }
-        "apply_update" => {
-            let (has_update, _, new_version, url) = check_for_update(tx);
-            if has_update {
-                if let (Some(v), Some(u)) = (new_version, url) {
-                    apply_update(&u, &v, tx)
-                } else {
-                    (false, "❌ Нет download_url для обновления".to_string())
-                }
-            } else {
-                (false, "ℹ Обновлений нет".to_string())
-            }
-        }
-        "detect_os" => {
-            print_setup_instructions(tx);
-            let mut info = format!("🖥 ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
-            info += &format!("\n  🌐 Прокси: {}", get_proxy_url());
-            info += &format!("\n  📦 school_packages: {}", folder_info_line("", &download_dir, &system_arch));
-            info += &format!("\n  🔄 updates: {}", folder_info_line("", &updates_dir, &system_arch));
-            info += &format!("\n  🔐 cryptopro_gia: {}", folder_info_line("", &crypto_dir, &system_arch));
-            info += &format!("\n  🔒 cer: {}", folder_info_line("", &cert_dir, &system_arch));
-            if let Some(free_mb) = get_free_space_mb(&download_dir) {
-                info += &format!("\n  💾 Свободно: {}", format_size_mb(free_mb));
-            }
-            info += &format!("\n\n  📝 Лог: {}", log_file_path());
-            (true, info)
-        }
-        "exit" => (true, "Выход".to_string()),
-        _ => (false, "Неизвестная команда".to_string()),
-    };
-    let _ = tx.send(LogEvent::Done(result.0, result.1));
-    log_to_file(&format!("=== Команда {} завершена: {} ===", cmd_id, if result.0 { "УСПЕХ" } else { "ОШИБКА" }));
 }
 
 // ==================== ЭКСПОРТ ОТЧЁТА ====================
@@ -1792,6 +1687,128 @@ fn export_report(format: &str, tx: &mpsc::Sender<LogEvent>) -> (bool, String) {
     }
 }
 
+// ==================== ДИСПЕТЧЕР КОМАНД ====================
+
+fn run_command(cmd_id: &str, tx: &mpsc::Sender<LogEvent>) {
+    log_to_file(&format!("=== Запуск команды: {} ===", cmd_id));
+
+    let pkg_dir = get_school_packages_dir();
+    let upd_dir = get_updates_dir();
+    if pkg_dir == upd_dir {
+        let _ = tx.send(LogEvent::Line("⚠ school_packages и updates указывают на одну папку!".to_string()));
+    }
+
+    ensure_directories();
+
+    if let Some(free_mb) = get_free_space_mb(&pkg_dir) {
+        if free_mb < MIN_FREE_SPACE_CRITICAL_MB {
+            let _ = tx.send(LogEvent::Line(format!("❌ КРИТИЧЕСКИ МАЛО МЕСТА: свободно {}", format_size_mb(free_mb))));
+        } else {
+            let _ = tx.send(LogEvent::Line(format!("💾 Свободно на диске: {}", format_size_mb(free_mb))));
+        }
+    }
+
+    let needs_prepare = matches!(cmd_id, "download_updates" | "install_updates" | "download_packages" | "install_packages" | "install_cryptopro_gia");
+    if needs_prepare {
+        let (ok, msg) = prepare_environment(tx);
+        if !ok {
+            let _ = tx.send(LogEvent::Done(false, format!("Подготовка окружения: {}", msg)));
+            return;
+        }
+    }
+
+    let download_dir = get_school_packages_dir();
+    let updates_dir = get_updates_dir();
+    let cert_dir = get_cert_dir();
+    let crypto_dir = get_crypto_dir();
+    let system_arch = detect_arch();
+
+    let result: (bool, String) = match cmd_id {
+        "setup_env" => prepare_environment(tx),
+        "auto_proxy" => auto_setup_proxy(tx),
+        "download_updates" => download_updates(&updates_dir, tx),
+        "install_updates" => {
+            if !Path::new(&updates_dir).exists() { (false, "Папка не найдена. Сначала скачайте обновления.".to_string()) }
+            else { install_from_folder(&updates_dir, tx) }
+        }
+        "download_packages" => download_packages(&get_packages(), &download_dir, tx),
+        "install_packages" => {
+            if !Path::new(&download_dir).exists() { (false, "Папка не найдена. Сначала скачайте пакеты.".to_string()) }
+            else { install_from_folder(&download_dir, tx) }
+        }
+        "install_cryptopro_gia" => install_cryptopro_gia(&crypto_dir, &download_dir, tx),
+        "find_cert" => {
+            let _ = tx.send(LogEvent::Line("🔍 Поиск сертификата ca-root.crt...".to_string()));
+            if let Some(cert_path) = find_cert_on_mounted_devices() {
+                let _ = tx.send(LogEvent::Line(format!("✅ Найден: {}", cert_path)));
+                (true, format!("Сертификат найден: {}", cert_path))
+            } else if let Some(device) = find_first_usb_device() {
+                if let Some(mount_point) = mount_usb_device(&device, tx) {
+                    let cert_path = Path::new(&mount_point).join(CERT_FILE_NAME);
+                    if cert_path.exists() {
+                        unmount_device(&mount_point, tx);
+                        (true, format!("Сертификат найден на USB: {}", cert_path.display()))
+                    } else {
+                        unmount_device(&mount_point, tx);
+                        (false, "Сертификат не найден на USB".to_string())
+                    }
+                } else { (false, "Не удалось смонтировать USB".to_string()) }
+            } else {
+                (false, "USB-устройства не найдены".to_string())
+            }
+        }
+        "export_report" => export_report("txt", tx),
+        "check_integrity" => {
+            let (ok, msg, _) = verify_checksums(&download_dir, tx);
+            (ok, msg)
+        }
+        "check_update" => {
+            let (has_update, msg, new_version, url) = check_for_update(tx);
+            if has_update {
+                match (new_version, url) {
+                    (Some(_v), Some(_u)) => {
+                        let _ = tx.send(LogEvent::Line(format!("   💡 Для применения: команда '🔁 Применить обновление'".to_string())));
+                        (true, msg)
+                    }
+                    _ => (false, msg)
+                }
+            } else {
+                (false, msg)
+            }
+        }
+        "apply_update" => {
+            let (has_update, _, new_version, url) = check_for_update(tx);
+            if has_update {
+                if let (Some(v), Some(u)) = (new_version, url) {
+                    apply_update(&u, &v, tx)
+                } else {
+                    (false, "❌ Нет download_url для обновления".to_string())
+                }
+            } else {
+                (false, "ℹ Обновлений нет".to_string())
+            }
+        }
+        "detect_os" => {
+            print_setup_instructions(tx);
+            let mut info = format!("🖥 ОС: МОС ОС (ROSA) | Арх: {}", system_arch);
+            info += &format!("\n  🌐 Прокси: {}", get_proxy_url());
+            info += &format!("\n  📦 school_packages: {}", folder_info_line("", &download_dir, &system_arch));
+            info += &format!("\n  🔄 updates: {}", folder_info_line("", &updates_dir, &system_arch));
+            info += &format!("\n  🔐 cryptopro_gia: {}", folder_info_line("", &crypto_dir, &system_arch));
+            info += &format!("\n  🔒 cer: {}", folder_info_line("", &cert_dir, &system_arch));
+            if let Some(free_mb) = get_free_space_mb(&download_dir) {
+                info += &format!("\n  💾 Свободно: {}", format_size_mb(free_mb));
+            }
+            info += &format!("\n\n  📝 Лог: {}", log_file_path());
+            (true, info)
+        }
+        "exit" => (true, "Выход".to_string()),
+        _ => (false, "Неизвестная команда".to_string()),
+    };
+    let _ = tx.send(LogEvent::Done(result.0, result.1));
+    log_to_file(&format!("=== Команда {} завершена: {} ===", cmd_id, if result.0 { "УСПЕХ" } else { "ОШИБКА" }));
+}
+
 // ==================== TUI ====================
 
 #[derive(Clone)]
@@ -1810,12 +1827,12 @@ const COMMANDS: &[CommandItem] = &[
     CommandItem { id: "find_cert", name: "Найти сертификат на USB", description: "Ищет ca-root.crt на смонтированных устройствах и USB.", icon: "🔍", hotkey: '8' },
     CommandItem { id: "download_updates", name: "Скачать обновления системы", description: "Скачивает обновления в updates/ с проверкой места.", icon: "⬇", hotkey: '3' },
     CommandItem { id: "install_updates", name: "Установить обновления", description: "Устанавливает из updates/ с проверкой целостности.", icon: "⬆", hotkey: '4' },
-    CommandItem { id: "download_packages", name: "Скачать пакеты (параллельно)", description: "4 потока скачивают task-koge + r7-office + notepadqq. УЛУЧШЕНИЕ №11.", icon: "🚀", hotkey: '5' },
-    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ с проверкой SHA256.", icon: "📦", hotkey: '6' },
+    CommandItem { id: "download_packages", name: "Скачать пакеты (с зависимостями)", description: "Скачивает task-koge + r7-office + notepadqq со всеми зависимостями для офлайн-установки.", icon: "📦", hotkey: '5' },
+    CommandItem { id: "install_packages", name: "Установить пакеты", description: "Устанавливает из school_packages/ с проверкой SHA256.", icon: "🚀", hotkey: '6' },
     CommandItem { id: "install_cryptopro_gia", name: "Установить КриптоПро + ГИА", description: "5 шагов: newt → pcsc-lite → librtpkcs11ecp → КриптоПро → GIA11_PPE.", icon: "🔐", hotkey: '7' },
-    CommandItem { id: "check_integrity", name: "Проверить целостность пакетов", description: "Сверяет SHA256 всех .rpm с checksums.sha256. УЛУЧШЕНИЕ №12.", icon: "🧪", hotkey: 'c' },
-    CommandItem { id: "check_update", name: "Проверить обновления", description: "Запрашивает GitHub Releases и сравнивает версии. УЛУЧШЕНИЕ №13.", icon: "🔗", hotkey: 'u' },
-    CommandItem { id: "apply_update", name: "Применить обновление", description: "Скачивает новую версию, проверяет SHA256, заменяет бинарник. УЛУЧШЕНИЕ №13.", icon: "🔁", hotkey: 'r' },
+    CommandItem { id: "check_integrity", name: "Проверить целостность пакетов", description: "Сверяет SHA256 всех .rpm с checksums.sha256.", icon: "🧪", hotkey: 'c' },
+    CommandItem { id: "check_update", name: "Проверить обновления", description: "Запрашивает GitHub Releases и сравнивает версии.", icon: "🔗", hotkey: 'u' },
+    CommandItem { id: "apply_update", name: "Применить обновление", description: "Скачивает новую версию, проверяет SHA256, заменяет бинарник.", icon: "🔁", hotkey: 'r' },
     CommandItem { id: "export_report", name: "Экспорт отчёта (TXT)", description: "Создаёт TXT-отчёт об установленных пакетах.", icon: "📄", hotkey: 'e' },
     CommandItem { id: "exit", name: "Выход", description: "Завершить программу.", icon: "✕", hotkey: '0' },
 ];
@@ -1985,8 +2002,8 @@ fn ui(f: &mut Frame, app: &App) {
             Line::from("  8 — 🔍 Найти сертификат на USB"),
             Line::from("  3 — ⬇ Скачать обновления системы"),
             Line::from("  4 — ⬆ Установить обновления"),
-            Line::from("  5 — 🚀 Скачать пакеты (4 потока)"),
-            Line::from("  6 — 📦 Установить пакеты"),
+            Line::from("  5 — 📦 Скачать пакеты (с зависимостями)"),
+            Line::from("  6 — 🚀 Установить пакеты"),
             Line::from("  7 — 🔐 Установить КриптоПро + ГИА"),
             Line::from("  C — 🧪 Проверить целостность (SHA256)"),
             Line::from("  U — 🔗 Проверить обновления"),
